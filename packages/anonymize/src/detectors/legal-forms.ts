@@ -22,8 +22,13 @@ const CAP_WORD = `(?:[${UPPER}]{2,}|[${UPPER}][${LOWER}${UPPER}]+)`;
 // (2-3 chars, e.g. "CZ" in "Metrostav CZ s.r.o."),
 // or digit-only token (1-4 digits, e.g. "2028" in
 // "Invest 2028 s.r.o." or "12" in "Praha 12 s.r.o.").
+// Excludes "and"/"und"/"et" so the prefix can't span
+// entity boundaries like "Paul Newman and Apple, Inc."
+// — those connectors are still permitted inside
+// LOWER_CONNECTOR when followed by a lowercase word.
 const ANY_WORD =
-  `(?:[${UPPER}${LOWER}][${LOWER}${UPPER}]+` +
+  `(?:(?!(?:and|und|et)(?![${UPPER}${LOWER}]))` +
+  `[${UPPER}${LOWER}][${LOWER}${UPPER}]+` +
   `|[${UPPER}]{2,3}` +
   `|\\d{1,4})`;
 // All-caps word: 2+ uppercase letters, no lowercase.
@@ -55,12 +60,37 @@ const buildPatternString = (forms: string[]): string | null => {
   // Separator between name words: space, ampersand,
   // comma, dot, hyphen (1-4 chars). Connector words
   // (a, and, und, et, e, y, i) are allowed only when
-  // followed by a lowercase-starting word — this
-  // prevents greedy extension across entity boundaries
-  // like "Foo s.r.o. a BAR s.r.o."
-  const LOWER_CONNECTOR = `\\s+(?:a|and|und|et|e|y|i)\\s+(?=[${LOWER}])`;
-  const SEPARATOR = `(?:[\\s&,.${DASH_INNER}]{1,4}|${LOWER_CONNECTOR})`;
-  const prefix = `(?:${CAP_WORD})` + `(?:${SEPARATOR}(?:${ANY_WORD})){0,10}`;
+  // followed by a lowercase-starting word.
+  // Horizontal whitespace only (no newline) — keeping
+  // newlines out of the separators prevents the DFA
+  // size from blowing up across line boundaries and
+  // matches the existing pattern in escapeForRegex.
+  const HSPACE = "[^\\S\\n]";
+  const LOWER_CONNECTOR = `${HSPACE}+(?:a|and|und|et|e|y|i)${HSPACE}+(?=[${LOWER}])`;
+  const SIMPLE_SEP = `(?:${HSPACE}|[&,.${DASH_INNER}]){1,4}`;
+  // Uppercase- or digit-only word for the strict head.
+  // Lowercase-starting tokens can only appear in the
+  // optional tail below.
+  const CAP_OR_NUM_WORD = `(?:${CAP_WORD}|\\d{1,4})`;
+  // A lowercase-starting word, excluding "and"/"und"/
+  // "et" so they cannot sneak past the connector guard.
+  const LOWER_WORD =
+    `(?:(?!(?:and|und|et)(?![${UPPER}${LOWER}]))` +
+    `[${LOWER}][${LOWER}${UPPER}]+)`;
+  // Prefix structure:
+  //   CapWord (SimpleSep CapOrNumWord)*           # strict head
+  //   ( SimpleSep LowerWord                       # optional tail must
+  //     ((LowerConnector|SimpleSep) AnyWord)* )?  # start lowercase
+  // The tail (with LowerConnector) is only reachable
+  // after at least one lowercase token — so it can't
+  // bridge "<Cap> <Cap> and lower …" patterns across
+  // an entity boundary (e.g. "Paul Newman and company
+  // Apple, Inc.").
+  const head = `(?:${CAP_WORD})(?:${SIMPLE_SEP}(?:${CAP_OR_NUM_WORD})){0,10}`;
+  const tail =
+    `${SIMPLE_SEP}(?:${LOWER_WORD})` +
+    `(?:(?:${LOWER_CONNECTOR}|${SIMPLE_SEP})(?:${ANY_WORD})){0,10}`;
+  const prefix = `(?:${head})(?:${tail})?`;
   const separator = `(?:\\s+|,\\s*)`;
 
   return `${prefix}${separator}(?:${alt})(?![${LOWER}])`;
@@ -133,6 +163,26 @@ export const buildLegalFormPatterns = async (): Promise<string[]> => {
 // ── Backward extension ──────────────────────────────
 
 const CONNECTOR_RE = /^(?:a|and|und|et|e|y|i|&)$/i;
+// Multi-char "and"-type connectors. When backward
+// extension hits one of these with exactly two
+// uppercase words behind it, the pattern looks like
+// "<First> <Last> and <ORG>" and we stop rather than
+// swallow the personal name into the org span.
+const AND_TYPE_CONNECTOR_RE = /^(?:and|und|et)$/i;
+const UPPER_LETTER_RE = /^\p{Lu}/u;
+// Capitalised words that, when they begin a legal-form
+// match, signal the match is the tail of a multi-word
+// organisation name ("Acme Widgets and Company, Inc.",
+// "The Bank of America and Trust Company, Inc.").
+// In that mode the two-cap-words "First Last and ORG"
+// heuristic is suspended and a small set of in-name
+// prepositions ("of") are crossable during backward
+// extension. Capitalised-form only — lowercase "trust"
+// or "bank" are common verbs/nouns.
+const COMPANY_SUFFIX_WORDS_RE =
+  /^(?:Company|Co|Bank|Brothers|Bros|Sons|Group|Holdings|Trust|Partners|Associates|Corporation|Industries|Enterprises|Solutions|Systems|Services|Foundation|Institute)$/;
+const IN_NAME_PREPOSITION_RE = /^(?:of|the)$/i;
+const ENTITY_HEAD_WORD_RE = /^[\p{L}\p{M}&]+/u;
 const LEADING_CLAUSE_RE = /(?:^|\s)(?:by\s+and\s+between|is\s+between)\s+/giu;
 
 /**
@@ -167,6 +217,25 @@ const findWordBefore = (
 };
 
 /**
+ * Count consecutive uppercase-starting words immediately
+ * before `pos`. Stops at the first non-upper word or at
+ * text/line start. Used to disambiguate "<First> <Last>
+ * and <ORG>" from "<Multi-word Org> and <Continuation>".
+ */
+const countUpperWordsBefore = (fullText: string, pos: number): number => {
+  let count = 0;
+  let scan = pos;
+  while (scan > 0) {
+    const found = findWordBefore(fullText, scan);
+    if (!found) break;
+    if (!UPPER_LETTER_RE.test(found.word)) break;
+    count++;
+    scan = found.start;
+  }
+  return count;
+};
+
+/**
  * Extend a match backward through uppercase words and
  * lowercase connectors. Stops at start of text,
  * newline, or a word that doesn't qualify.
@@ -174,8 +243,22 @@ const findWordBefore = (
  * Connectors (a, and, und, et, ...) are only consumed
  * when there is a valid word before them — a trailing
  * connector at an entity boundary is not consumed.
+ * For multi-char "and"-type connectors we additionally
+ * refuse to cross when exactly two uppercase words
+ * precede them ("First Last and ORG, Inc." shape) —
+ * unless the match itself begins with a known company-
+ * suffix word ("…and Company, Inc."), in which case
+ * the chain belongs to one organisation. In that
+ * suffix-mode we also cross in-name prepositions
+ * ("Bank of America and Trust Company, Inc.").
  */
 const extendBackward = (fullText: string, matchStart: number): number => {
+  // Read the first word of the match to decide whether
+  // we're inside a multi-word organisation name.
+  const headWord =
+    ENTITY_HEAD_WORD_RE.exec(fullText.slice(matchStart))?.[0] ?? "";
+  const suffixMode = COMPANY_SUFFIX_WORDS_RE.test(headWord);
+
   let pos = matchStart;
 
   while (pos > 0) {
@@ -184,23 +267,41 @@ const extendBackward = (fullText: string, matchStart: number): number => {
 
     const { word, start: wordStart } = found;
 
-    const isUpper = /^\p{Lu}/u.test(word);
+    const isUpper = UPPER_LETTER_RE.test(word);
     const isConnector = CONNECTOR_RE.test(word);
+    const isInNamePrep = suffixMode && IN_NAME_PREPOSITION_RE.test(word);
 
     if (isUpper) {
       // Uppercase word — always accept
       pos = wordStart;
     } else if (isConnector) {
+      if (
+        !suffixMode &&
+        AND_TYPE_CONNECTOR_RE.test(word) &&
+        countUpperWordsBefore(fullText, wordStart) === 2
+      ) {
+        // Looks like "<First> <Last> and <ORG>" — keep
+        // the person name out of the org span.
+        break;
+      }
       // Connector — only accept if there is a valid
       // (uppercase-starting) word before it
       const prev = findWordBefore(fullText, wordStart);
       if (!prev) break;
-      const prevIsUpper = /^\p{Lu}/u.test(prev.word);
+      const prevIsUpper = UPPER_LETTER_RE.test(prev.word);
       if (!prevIsUpper) break;
       // Move pos back to the start of the word that
       // precedes the connector; the connector and all
       // whitespace between it and prev.start are
       // included implicitly in the entity slice.
+      pos = prev.start;
+    } else if (isInNamePrep) {
+      // In suffix-mode only: cross lowercase in-name
+      // prepositions ("of", "the") when the preceding
+      // token is uppercase ("Bank of America").
+      const prev = findWordBefore(fullText, wordStart);
+      if (!prev) break;
+      if (!UPPER_LETTER_RE.test(prev.word)) break;
       pos = prev.start;
     } else {
       break;

@@ -1,6 +1,7 @@
 import type { Entity } from "../types";
 import type { PipelineContext } from "../context";
 import { defaultContext } from "../context";
+import { normalizeHomoglyphs } from "../util/homoglyphs";
 
 const TEMPLATE_PLACEHOLDER_RE = /^(?:\.{3,}|_{3,}|\[[\w\s]+\]|\{[\w\s]+\})$/;
 
@@ -252,18 +253,26 @@ export const filterFalsePositives = (
 
     if (normalized.label === "person") {
       const tokens = trimmed.split(/\s+/u);
-      const last = tokens
-        .at(-1)
-        ?.replace(/[.,;:!?]+$/u, "")
-        .toLowerCase();
-      if (tokens.length > 1 && last && PERSON_TRAILING_NOUNS.has(last)) {
+      // Fold homoglyphs *before* lowercasing: uppercase
+      // Greek lookalikes (Α, Ε, …) lowercase to Greek
+      // lowercase code points that aren't in the
+      // homoglyph map, so the order matters.
+      const last = tokens.at(-1)?.replace(/[.,;:!?]+$/u, "");
+      const lastFolded = last
+        ? normalizeHomoglyphs(last).toLowerCase()
+        : undefined;
+      if (
+        tokens.length > 1 &&
+        lastFolded &&
+        PERSON_TRAILING_NOUNS.has(lastFolded)
+      ) {
         continue;
       }
     }
 
     if (
       (normalized.label === "person" || normalized.label === "organization") &&
-      roles.has(trimmed.toLowerCase())
+      roles.has(normalizeHomoglyphs(trimmed).toLowerCase())
     ) {
       continue;
     }
