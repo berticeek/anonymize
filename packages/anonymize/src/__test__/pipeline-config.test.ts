@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
-import { createPipelineContext, runPipeline } from "../index";
+import {
+  createPipelineContext,
+  DEFAULT_ENTITY_LABELS,
+  redactText,
+  runPipeline,
+} from "../index";
 import type { Dictionaries, PipelineConfig } from "../types";
 import { loadTestDictionaries } from "./load-dictionaries";
 
@@ -909,5 +914,148 @@ describe("pipeline config semantics", () => {
     expect(address!.text).toContain("Dělnická 213/12");
     expect(address!.text).toContain("Praha 7");
     expect(address!.text).not.toContain("Acme");
+  });
+});
+
+describe("misc entity label", () => {
+  test("misc is exported in DEFAULT_ENTITY_LABELS", () => {
+    expect(DEFAULT_ENTITY_LABELS).toContain("misc");
+  });
+
+  test("no detector fires misc on plain text", async () => {
+    const entities = await detect(
+      "Jan Novák lives in Praha and works at Acme s.r.o.",
+      {
+        enableRegex: true,
+        enableLegalForms: true,
+        enableTriggerPhrases: true,
+        enableDenyList: true,
+        enableNameCorpus: true,
+        enableGazetteer: true,
+        denyListCountries: ["CZ"],
+        labels: [...DEFAULT_ENTITY_LABELS],
+        dictionaries: await getDictionaries(),
+      },
+    );
+    expect(entities.some((entity) => entity.label === "misc")).toBe(false);
+  });
+
+  test("custom deny-list with misc label yields [MISC_N] placeholder", async () => {
+    const fullText = "The case file references Widget X and Widget X again.";
+    const entities = await detect(fullText, {
+      enableDenyList: true,
+      customDenyList: [
+        {
+          value: "Widget X",
+          label: "misc",
+        },
+      ],
+      labels: ["misc"],
+    });
+
+    expect(entities).toEqual([
+      expect.objectContaining({
+        label: "misc",
+        text: "Widget X",
+        source: "deny-list",
+        sourceDetail: "custom-deny-list",
+      }),
+      expect.objectContaining({
+        label: "misc",
+        text: "Widget X",
+        source: "deny-list",
+        sourceDetail: "custom-deny-list",
+      }),
+    ]);
+
+    const { redactedText, redactionMap } = redactText(fullText, entities);
+    expect(redactedText).toBe(
+      "The case file references [MISC_1] and [MISC_1] again.",
+    );
+    expect(redactionMap.get("[MISC_1]")).toBe("Widget X");
+  });
+
+  test("misc case-variants share a placeholder", async () => {
+    // `Widget X` and `widget x` are the same real-world entity from
+    // the user's perspective; redact.ts case-normalises MISC so both
+    // surface forms collapse to one placeholder, matching
+    // PERSON/ORG/ADDRESS behaviour.
+    const fullText = "Widget X starts a sentence; later widget x reappears.";
+    const entities = await detect(fullText, {
+      enableDenyList: true,
+      customDenyList: [{ value: "Widget X", label: "misc" }],
+      labels: ["misc"],
+    });
+    const { redactedText, redactionMap } = redactText(fullText, entities);
+    expect(redactedText).toBe(
+      "[MISC_1] starts a sentence; later [MISC_1] reappears.",
+    );
+    expect(redactionMap.size).toBe(1);
+  });
+
+  test("NER inference is skipped when only misc labels are requested", async () => {
+    // Filtering misc out of the NER schema can leave the
+    // schema empty (e.g. caller passes `labels: ["misc"]`).
+    // Many NER backends reject empty label arrays; the
+    // pipeline should skip the call entirely in that case.
+    let nerCalled = false;
+    await runPipeline({
+      fullText: "Project Widget X is mentioned.",
+      config: {
+        threshold: 0.5,
+        enableTriggerPhrases: false,
+        enableRegex: false,
+        enableLegalForms: false,
+        enableNameCorpus: false,
+        enableDenyList: true,
+        enableGazetteer: false,
+        enableNer: true,
+        enableConfidenceBoost: false,
+        enableCoreference: false,
+        customDenyList: [{ value: "Widget X", label: "misc" }],
+        labels: ["misc"],
+        workspaceId: "test",
+      },
+      gazetteerEntries: [],
+      context: createPipelineContext(),
+      nerInference: async () => {
+        nerCalled = true;
+        return [];
+      },
+    });
+    expect(nerCalled).toBe(false);
+  });
+
+  test("misc is excluded from the NER label schema", async () => {
+    // MISC is a custom-deny-list-only label; surfacing it to the
+    // NER schema would invite zero-shot guesses on arbitrary spans.
+    const seenLabels: string[][] = [];
+    await runPipeline({
+      fullText: "Some sentence.",
+      config: {
+        threshold: 0.5,
+        enableTriggerPhrases: false,
+        enableRegex: false,
+        enableLegalForms: false,
+        enableNameCorpus: false,
+        enableDenyList: false,
+        enableGazetteer: false,
+        enableNer: true,
+        enableConfidenceBoost: false,
+        enableCoreference: false,
+        labels: [...DEFAULT_ENTITY_LABELS],
+        workspaceId: "test",
+      },
+      gazetteerEntries: [],
+      context: createPipelineContext(),
+      nerInference: async (_text, labels) => {
+        seenLabels.push([...labels]);
+        return [];
+      },
+    });
+    expect(seenLabels.length).toBe(1);
+    expect(seenLabels[0]).not.toContain("misc");
+    // Sanity: other defaults still flow through unchanged.
+    expect(seenLabels[0]).toContain("person");
   });
 });
