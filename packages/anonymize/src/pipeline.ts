@@ -728,10 +728,14 @@ export const runPipeline = async (
   );
   if (regexEntities.length > 0) log("regex", `${regexEntities.length} matches`);
 
-  if (legalFormsEnabled) {
+  if (legalFormsEnabled || config.enableTriggerPhrases) {
     // Populate the per-language legal-role-head cache so the
     // synchronous match processor below can read it. Cheap and
     // idempotent — only the first call kicks the loads.
+    // Triggers also need this: the trigger reclassification step
+    // (person → organization when the captured text contains a
+    // legal-form suffix) reads `getKnownLegalSuffixes()`, which
+    // falls back to the seed list until the cache is warmed.
     await warmLegalRoleHeads();
   }
   const rawLegalFormEntities = legalFormsEnabled
@@ -1028,6 +1032,15 @@ export const runPipeline = async (
   // context doesn't leak sourceText across documents.
   ctx.corefSourceMap.clear();
   if (config.enableCoreference) {
+    // Coreference's alias filter rejects parenthetical
+    // captures that are nothing but a legal-form suffix
+    // ("(« SAS »)"), which needs the full vocabulary from
+    // `data/legal-forms.json`. Warm it here so configs
+    // that enable coreference without legal-form detection
+    // still see the complete suffix set.
+    if (!legalFormsEnabled) {
+      await warmLegalRoleHeads();
+    }
     const coreferenceSeeds = merged.filter(
       (entity) => !isCallerOwnedEntity(entity),
     );

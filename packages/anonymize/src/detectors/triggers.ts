@@ -12,7 +12,7 @@ import type {
   ValidIdValidator,
 } from "../types";
 import { POST_NOMINALS } from "../config/titles";
-import { LEGAL_SUFFIXES } from "../config/legal-forms";
+import { getKnownLegalSuffixes } from "./legal-forms";
 import { loadLanguageConfigs } from "../util/lang-loader";
 import { DASH } from "../util/char-groups";
 
@@ -52,21 +52,46 @@ const POST_NOMINAL_RE = new RegExp(
 // reflexive pronouns "se", "sa" which appear in
 // person-trigger captures like
 // "Ing. Jan Novák, se sídlem...".
-const DEFINITIVE_LEGAL_FORMS = LEGAL_SUFFIXES;
-// Build case-sensitive regex. Short dot-free forms
-// (AG, SE, KG) get word boundaries to prevent substring
-// matches. All forms are uppercase in the list; the
-// regex is case-sensitive so "se"/"sa" won't match.
-const LEGAL_FORM_CHECK_RE = new RegExp(
-  DEFINITIVE_LEGAL_FORMS.map((f) => {
+//
+// The reclassification regex is built from the FULL legal-
+// form vocabulary (`data/legal-forms.json` plus
+// `LEGAL_SUFFIXES`) via `getKnownLegalSuffixes()`. The
+// pipeline always calls `warmLegalRoleHeads()` before
+// triggers run, so by the time `getLegalFormCheckRe()` is
+// invoked the cache is populated. The regex is built
+// lazily and re-cached when the underlying vocabulary
+// reference changes.
+const buildLegalFormCheckRe = (forms: readonly string[]): RegExp => {
+  // Dot-free letter-only forms get Unicode-aware word
+  // boundaries so short uppercase forms ("SE", "AG") and
+  // longer single-word forms ("Branch", "Limited") don't
+  // match as substrings of unrelated tokens. Forms with
+  // dots already terminate at non-letter chars naturally.
+  const parts = forms.map((f) => {
     const escaped = f
       .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
       .replace(/\\\./g, "\\.\\s*");
-    const isDotFree = !f.includes(".");
-    const isShort = f.length <= 4;
-    return isDotFree && isShort ? `\\b${escaped}\\b` : escaped;
-  }).join("|"),
-);
+    const isLetterOnly = /^[\p{L}\p{M}]+$/u.test(f);
+    return isLetterOnly
+      ? `(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`
+      : escaped;
+  });
+  return new RegExp(parts.join("|"), "u");
+};
+
+let cachedLegalFormCheckRe: RegExp | null = null;
+let cachedLegalFormCheckSource: readonly string[] | null = null;
+const getLegalFormCheckRe = (): RegExp => {
+  const source = getKnownLegalSuffixes();
+  if (
+    cachedLegalFormCheckSource !== source ||
+    cachedLegalFormCheckRe === null
+  ) {
+    cachedLegalFormCheckSource = source;
+    cachedLegalFormCheckRe = buildLegalFormCheckRe(source);
+  }
+  return cachedLegalFormCheckRe;
+};
 
 // ── Validation compilation ─────────────────────────
 
@@ -786,8 +811,21 @@ const extractValue = (
       // a colon or whitespace separator between the
       // keyword and value (e.g., "IČO: 12345678" or
       // "IČO 12345678", but not "IČO12345678").
+      //
+      // Exception: when the trigger itself ends in a
+      // number-marker character ("n°", "№", "#"), the
+      // value can follow the marker without any
+      // intervening separator ("SIREN n°123456789"). In
+      // that case we accept an empty separator too.
       const raw = text.slice(triggerEnd);
-      const sepMatch = /^(?:\s*:\s*|\s+)/.exec(raw);
+      const triggerLastChar = text[triggerEnd - 1] ?? "";
+      const allowEmptySep =
+        triggerLastChar === "°" ||
+        triggerLastChar === "º" ||
+        triggerLastChar === "№" ||
+        triggerLastChar === "#";
+      const sepRe = allowEmptySep ? /^(?:\s*:\s*|\s+|)/ : /^(?:\s*:\s*|\s+)/;
+      const sepMatch = sepRe.exec(raw);
       if (!sepMatch) {
         return null;
       }
@@ -807,19 +845,46 @@ const extractValue = (
         labelOffset = labelMatch[0].length;
         afterSep = afterSep.slice(labelOffset);
       }
-      // Optional letter prefix (e.g., VAT prefix "CZ",
-      // "PL"). Case-insensitive so lowercase variants
+      // Value shape: optional country prefix (e.g. "CZ",
+      // "PL", "FR"), optional whitespace, an optional
+      // 2-char alphanumeric key with optional trailing
+      // space (covers spaced French VAT keys whose first
+      // char is a letter, like "FR A1 123456789" or
+      // "FR AB 123456789"), then a digit, then 4+ value
+      // chars. The trailing class permits letters so
+      // alphanumeric VAT keys like "FR1A123456789" and
+      // French NIR Corsican department codes like
+      // "1 84 12 2A 075 …" are captured. A letter is only
+      // admitted when it is glued directly to a preceding
+      // digit (`(?<=\d)[A-Z]`), so the regex cannot grow
+      // past whitespace into a one-letter prose word
+      // ("SIREN 123456789 a son siège" stops at "9").
+      // Case-insensitive so lowercase variants
       // ("DIČ cz12345678", "VAT number pl1234567890")
-      // still validate via stdnum downstream. Dots are
-      // permitted inside the value so dotted IDs such as
-      // Brazilian RG ("12.345.678-9") and dotted CPF/CNPJ
-      // values introduced by triggers are captured.
-      // Require at least two leading digits before the
-      // dot-permitting tail so single-digit dotted dates
-      // ("6.11.2025") after triggers like "DNI" or "RG"
-      // do not slide in. Stricter checksum validation for
-      // CPF/CNPJ runs in the regex detector.
-      const idMatch = /^[A-Z]{0,6}\s?\d{2}[\d\s.\-/]{3,}/i.exec(afterSep);
+      // still validate via stdnum downstream. An optional
+      // 2-char alphanumeric key with optional trailing
+      // space covers spaced French VAT keys whose first
+      // char is a letter, like "FR A1 123456789" or
+      // "FR AB 123456789". Dots are permitted inside the
+      // value so dotted IDs such as Brazilian RG
+      // ("12.345.678-9") and dotted CPF/CNPJ values
+      // introduced by triggers are captured. Require at
+      // least two leading digits before the dot-permitting
+      // tail so single-digit dotted dates ("6.11.2025")
+      // after triggers like "DNI" or "RG" do not slide
+      // in. Stricter checksum validation for CPF/CNPJ runs
+      // in the regex detector. A letter is only admitted
+      // when it is glued directly to a preceding digit
+      // (`(?<=\d)[A-Z]`), so the regex cannot grow past
+      // whitespace into a one-letter prose word
+      // ("SIREN 123456789 a son siège" stops at "9").
+      // This still captures alphanumeric VAT keys like
+      // "FR1A123456789" and French NIR Corsican department
+      // codes like "1 84 12 2A 075 …".
+      const idMatch =
+        /^[A-Z]{0,6}\s?(?:[A-Z0-9]{2}\s?)?\d{2}(?:(?<=\d)[A-Z]|[\d\s.\-/]){3,}/i.exec(
+          afterSep,
+        );
       if (!idMatch) {
         return null;
       }
@@ -861,6 +926,7 @@ const extractValue = (
       // and a lowercase letter, e.g. "nábř. ").
       const maxLen = strategy.maxChars ?? 120;
       const UPPER_RE = /\p{Lu}/u;
+      const stopKeywords = getAddressStopKeywordsSync();
       let end = 0;
 
       while (end < valueText.length && end < maxLen) {
@@ -872,6 +938,25 @@ const extractValue = (
         // trigger and value.
         if (ch === "\n" || ch === "(") {
           break;
+        }
+
+        // Whitespace boundary: when an address has no
+        // commas (e.g. headline-style triggers like
+        // "Adresse : 10 rue de la Paix Email : a@b.fr"),
+        // the comma-scoped stop-keyword check below
+        // never fires. Re-check the stop list at every
+        // whitespace boundary so a following field
+        // label terminates the address before its value.
+        if (ch === " " || ch === "\t") {
+          const afterWs = valueText.slice(end).trimStart().toLowerCase();
+          const hitsKeyword = stopKeywords.some((kw) => {
+            if (!afterWs.startsWith(kw)) return false;
+            const next = afterWs[kw.length];
+            return next === undefined || /[\s:;.,!?()\d]/.test(next);
+          });
+          if (hitsKeyword) {
+            break;
+          }
         }
 
         // Period: stop unless it's an abbreviation.
@@ -918,7 +1003,8 @@ const extractValue = (
           // ". " + uppercase start) — that case
           // happens when the address has already ended
           // and the next clause begins, e.g.
-          // "z siedzibą w Warszawie. Kapitał…".
+          // "z siedzibą w Warszawie. Kapitał…" /
+          // "Adresse : 10 rue de la Paix. Jean Dupont…".
           if (
             next === " " &&
             afterNext !== undefined &&
@@ -1007,6 +1093,49 @@ const extractValue = (
       };
     }
 
+    case "match-pattern": {
+      // Anchor the configured pattern to the start of the
+      // value text (after the generic leading-whitespace/
+      // colon strip above). This prevents a missing or
+      // placeholder value from stealing the next numeric
+      // field on the same line: e.g. with a phone trigger
+      // applied to `Téléphone : non communiqué SIREN :
+      // 123456789`, an unanchored search would pull the
+      // SIREN digits into the phone entity. Stops at the
+      // first newline so a header-style trigger cannot
+      // pull a value from a following line. The compiled
+      // regex strips `g`/`y` flags so it stays stateless
+      // across calls.
+      const nlIdx = valueText.indexOf("\n");
+      const searchText = nlIdx === -1 ? valueText : valueText.slice(0, nlIdx);
+      if (searchText.length === 0) {
+        return null;
+      }
+      const flags = (strategy.flags ?? "").replace(/[gy]/g, "");
+      // Wrap the pattern in a non-capturing group so a
+      // leading anchor authored in the config (e.g. `^`)
+      // and authored alternation precedence still work
+      // when the engine prepends its own start anchor.
+      const anchoredSource = `^(?:${strategy.pattern})`;
+      let re: RegExp;
+      try {
+        re = new RegExp(anchoredSource, flags);
+      } catch {
+        return null;
+      }
+      const m = re.exec(searchText);
+      if (!m || m[0].length === 0) {
+        return null;
+      }
+      const matchStart = m.index;
+      const matchEnd = matchStart + m[0].length;
+      return {
+        start: valueStart + matchStart,
+        end: valueStart + matchEnd,
+        text: m[0],
+      };
+    }
+
     default:
       return null;
   }
@@ -1049,13 +1178,17 @@ export const processTriggerMatches = (
       continue;
     }
 
-    // Right word-boundary: reject if followed by a
-    // letter — but skip this check when the trigger
-    // itself ends with whitespace (e.g., "pan ",
-    // "město ") since the trailing space already
-    // acts as a boundary delimiter.
+    // Right word-boundary: reject only when the trigger
+    // ends with a letter AND is followed by another
+    // letter (which would mean the keyword bleeds into
+    // a longer word, e.g. "pan" inside "pana"). Triggers
+    // ending in punctuation (`:`, `'`, `’`, `°`, `.`, …)
+    // or whitespace are already self-bounded: whatever
+    // follows cannot extend the keyword token, so any
+    // following character (letter, digit, etc.) is fine.
+    const triggerLastChar = rule.trigger.at(-1) ?? "";
     if (
-      !rule.trigger.endsWith(" ") &&
+      LETTER_RE.test(triggerLastChar) &&
       LETTER_RE.test(fullText[match.end] ?? "")
     ) {
       continue;
@@ -1092,7 +1225,7 @@ export const processTriggerMatches = (
       // This is universal — every person with a legal form
       // is an organisation, no per-group config needed.
       const effectiveLabel =
-        rule.label === "person" && LEGAL_FORM_CHECK_RE.test(entityText)
+        rule.label === "person" && getLegalFormCheckRe().test(entityText)
           ? "organization"
           : rule.label;
 
