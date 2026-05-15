@@ -396,8 +396,14 @@ const stripQuotes = (value: {
   };
 };
 
-/** Hard stop characters for to-next-comma scanning. */
-const COMMA_STOP_CHARS = new Set(["\n", "(", "\t", ";"]);
+/**
+ * Hard stop characters for to-next-comma scanning. A closing
+ * parenthesis or closing bracket terminates a clause just like
+ * an opening one: `State of New York or any other jurisdiction)`
+ * is the tail of a parenthesised insertion, not the start of a
+ * larger phrase that should be absorbed into a jurisdiction span.
+ */
+const COMMA_STOP_CHARS = new Set(["\n", "(", ")", "[", "]", "\t", ";"]);
 
 /**
  * Sentence-terminator detection: a period that genuinely ends
@@ -646,13 +652,11 @@ const extractValue = (
             )
           : null;
       let end = 0;
-      let foundStop = false;
 
       while (end < valueText.length) {
         const ch = valueText[end];
         // Hard stops: newline, paren, tab, semicolon
         if (ch !== undefined && COMMA_STOP_CHARS.has(ch)) {
-          foundStop = true;
           break;
         }
         // Sentence terminator: a period that genuinely ends
@@ -661,7 +665,6 @@ const extractValue = (
         // abbreviation dots (Ste./RNDr./Mr.) by requiring a
         // real word before the period.
         if (ch === "." && isSentenceTerminator(valueText, end)) {
-          foundStop = true;
           break;
         }
         // Trigger-supplied stop words (e.g. "dne", "vložka"
@@ -673,7 +676,6 @@ const extractValue = (
           (end === 0 || !/[\p{L}\p{N}]/u.test(valueText[end - 1] ?? "")) &&
           stopWordRe.test(valueText.slice(end))
         ) {
-          foundStop = true;
           break;
         }
         // Comma: for person triggers, check if followed
@@ -696,18 +698,30 @@ const extractValue = (
             continue;
           }
           // Regular comma — stop here
-          foundStop = true;
           break;
         }
         end++;
       }
 
-      // Only cap at 100 chars when no stop char was
-      // found (fallback for unterminated values). When
-      // a stop char exists, respect its position even
-      // if > 100.
-      if (!foundStop) {
-        end = Math.min(end, 100);
+      // Per-trigger hard length cap. Applies even when a
+      // stop char was found, so jurisdiction triggers
+      // ("State of Delaware") cannot absorb forum-selection
+      // clauses that legitimately end at a comma sentences
+      // away ("…in the event any dispute arises out of…").
+      // When no stop char was found, the cap also acts as
+      // the unterminated-value fallback; default to 100
+      // when the strategy does not configure one. When
+      // capping, retreat to the previous word boundary so
+      // the returned span never ends mid-word.
+      const lengthCap = strategy.maxLength ?? 100;
+      if (end > lengthCap) {
+        let capped = lengthCap;
+        const isWordChar = (i: number): boolean =>
+          /[\p{L}\p{N}]/u.test(valueText[i] ?? "");
+        while (capped > 0 && isWordChar(capped - 1) && isWordChar(capped)) {
+          capped--;
+        }
+        end = capped;
       }
 
       const rawSlice = valueText.slice(0, end);
