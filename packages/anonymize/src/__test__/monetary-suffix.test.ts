@@ -70,6 +70,11 @@ describe("monetary amounts with magnitude suffix", () => {
     expect(money.find((e) => e.text === "$1 billion")).toBeDefined();
   });
 
+  test("captures hundred-scale suffixes from language data", async () => {
+    const money = findMoney(await detect("Escrow holdback was $25 hundred."));
+    expect(money.find((e) => e.text === "$25 hundred")).toBeDefined();
+  });
+
   test("captures decimal magnitudes like '$1.5 trillion'", async () => {
     const text = "The fund manages $1.5 trillion in assets.";
     const money = findMoney(await detect(text));
@@ -160,6 +165,39 @@ describe("monetary amounts with magnitude suffix", () => {
     const money = findMoney(await detect("Need a $25 m cable for the rig."));
     expect(money).toHaveLength(1);
     expect(money[0]!.text).toBe("$25");
+  });
+
+  test("short PT-BR abbreviations do not apply globally", async () => {
+    const distance = findMoney(await detect("The hotel is $25 mi away."));
+    expect(distance).toHaveLength(1);
+    expect(distance[0]!.text).toBe("$25");
+
+    const schedule = findMoney(
+      await detect("The service costs $10 bi-weekly."),
+    );
+    expect(schedule).toHaveLength(1);
+    expect(schedule[0]!.text).toBe("$10");
+  });
+
+  test("ambiguous multilingual suffixes do not apply globally", async () => {
+    const setAside = findMoney(await detect("We paid $25 set aside for fees."));
+    expect(setAside).toHaveLength(1);
+    expect(setAside[0]!.text).toBe("$25");
+
+    const film = findMoney(
+      await detect("The order includes $25 mil spec film."),
+    );
+    expect(film).toHaveLength(1);
+    expect(film[0]!.text).toBe("$25");
+  });
+
+  test("share-quantity guard keeps ordinary English nouns", async () => {
+    const money = findMoney(
+      await detect("The estimate lists 100 USD parts and 50 USD labor."),
+    );
+    expect(money.map((entity) => entity.text)).toEqual(
+      expect.arrayContaining(["100 USD", "50 USD"]),
+    );
   });
 
   test("'$25M' uppercase abbreviation still captures as million", async () => {
