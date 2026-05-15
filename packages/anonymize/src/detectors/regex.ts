@@ -946,6 +946,74 @@ type CurrenciesData = {
 };
 
 /**
+ * Magnitude suffixes that turn a bare number into a
+ * larger monetary amount: `$25 million`, `EUR 1.5
+ * billion`, `$500K`, `$2bn`. Kept as typed constants
+ * (rather than inline regex alternations) so locale
+ * variants can be added without touching pattern code.
+ *
+ * Three groups with deliberately different casing
+ * rules:
+ *
+ *   - `MAGNITUDE_WORDS` — written-out units. Matched
+ *     case-insensitively with an optional plural `s`
+ *     because uppercase contract headings and badly
+ *     pluralised translations both appear in the wild.
+ *
+ *   - `MAGNITUDE_ABBREVIATIONS_CI` — multi-letter
+ *     abbreviations (`bn`, `bln`, `tn`, `trn`). Safe
+ *     to match case-insensitively: no plausible
+ *     non-monetary collision with `BN`/`Bn`/`bn` after
+ *     a currency prefix.
+ *
+ *   - `MAGNITUDE_ABBREVIATIONS_CS` — single-letter
+ *     abbreviations (`K`, `M`). Matched case-
+ *     sensitively (uppercase only) because lowercase
+ *     `m` collides with the metre unit (`$25 m cable`)
+ *     and lowercase `k` with kelvin/kilo. The
+ *     finance/journalism convention for these
+ *     shorthands is uppercase anyway (`$500K`, `$25M`).
+ *
+ * Single-letter `B` and `T` are deliberately omitted
+ * even in uppercase form: too many non-monetary
+ * collisions (grades, classes, model designators).
+ */
+const MAGNITUDE_WORDS: readonly string[] = [
+  "thousand",
+  "million",
+  "billion",
+  "trillion",
+  "quadrillion",
+];
+
+const MAGNITUDE_ABBREVIATIONS_CI: readonly string[] = [
+  "bn",
+  "bln",
+  "tn",
+  "trn",
+];
+
+const MAGNITUDE_ABBREVIATIONS_CS: readonly string[] = ["K", "M"];
+const SHARE_QUANTITY_MODIFIERS: readonly string[] = [
+  "ordinary",
+  "common",
+  "preferred",
+  "registered",
+  "treasury",
+  "voting",
+  "non-voting",
+  "restricted",
+  "class",
+  "series",
+];
+const SHARE_QUANTITY_MODIFIER_ALT =
+  SHARE_QUANTITY_MODIFIERS.map(escapeRegex).join("|");
+const QUANTITY_FOLLOWER_RE =
+  "(?![^\\S\\n\\t]+(?i:" +
+  `(?:(?:${SHARE_QUANTITY_MODIFIER_ALT})[^\\S\\n\\t]+){0,3}` +
+  "(?:shares?|stocks?|securities?|units?))\\b)";
+
+/**
  * Build symbol character class, code alternation,
  * and local-name alternation from currencies.json,
  * then return two monetary amount patterns: leading
@@ -1031,25 +1099,62 @@ const buildCurrencyPatterns = (data: CurrenciesData): string[] => {
     `(?:\\d{1,2}${DASH}?|${DASH}{1,2}))?`;
   const END = `(?:\\b|(?=\\s|[.,;!?)]|$))`;
 
-  // Leading symbol: $100, €1,000.50, € 100000
+  // Optional magnitude suffix: "$25 million", "$2bn",
+  // "$500K". Word and CI-abbrev branches accept any
+  // case; the CS-abbrev branch requires the uppercase
+  // form so lowercase `m`/`k` (metre, kelvin) does not
+  // hijack a perfectly innocent "$25 m cable" span.
+  //
+  // Each branch ends in `\b`, which prevents an abbrev
+  // letter from eating into the next word ("$25 km"
+  // stays at "$25" because ` k` + `m` has no word
+  // boundary after the `k`).
+  const wordsAlt = MAGNITUDE_WORDS.map(escapeRegex).join("|");
+  const abbrCiAlt = MAGNITUDE_ABBREVIATIONS_CI.map(escapeRegex).join("|");
+  const abbrCsAlt = MAGNITUDE_ABBREVIATIONS_CS.map(escapeRegex).join("|");
+  const MAGNITUDE =
+    `(?:` +
+    `[^\\S\\n\\t]+(?i:(?:${wordsAlt})s?)\\b` +
+    `|` +
+    `[^\\S\\n\\t]?(?i:${abbrCiAlt})\\b` +
+    `|` +
+    `[^\\S\\n\\t]?(?:${abbrCsAlt})\\b` +
+    `)?`;
+
+  // Leading symbol: $100, €1,000.50, € 100000,
+  // $25 million, $2bn.
   if (symbols) {
     patterns.push(
-      `(?:[${symbols}])` + `[^\\S\\n\\t]?` + `${NUM}${DECIMAL}${END}`,
+      `(?:[${symbols}])` +
+        `[^\\S\\n\\t]?` +
+        `${NUM}${DECIMAL}${MAGNITUDE}${END}`,
     );
   }
 
-  // Leading multi-char code: "Kč 10,—", "Fr. 500"
+  // Leading multi-char code: "Kč 10,—", "Fr. 500",
+  // "EUR 1.5 billion".
   if (trailingAlt) {
     patterns.push(
-      `\\b(?:${trailingAlt})` + `[^\\S\\n\\t]{0,2}` + `${NUM}${DECIMAL}${END}`,
+      `\\b(?:${trailingAlt})` +
+        `[^\\S\\n\\t]{0,2}` +
+        `${NUM}${DECIMAL}${MAGNITUDE}${END}`,
     );
   }
 
   // Trailing code/name: 100 USD, 1,000.50 CZK,
-  // 100000 Kč, 500 korun, 100 Fr.
+  // 100000 Kč, 500 korun, 100 Fr., 25 million USD,
+  // $25 million USD.
+  // Magnitude sits between the number and the code so
+  // "100 million USD" parses naturally; the existing
+  // 0-4 whitespace span absorbs the separator.
   if (trailingAlt) {
+    const optionalLeadingSymbol = symbols
+      ? `(?<![\\p{L}\\p{N}_])(?:[${symbols}][^\\S\\n\\t]?)?`
+      : "\\b";
     patterns.push(
-      `\\b${NUM}${DECIMAL}[^\\S\\n\\t]{0,4}` + `(?:${trailingAlt})${END}`,
+      `${optionalLeadingSymbol}${NUM}${DECIMAL}${MAGNITUDE}` +
+        `[^\\S\\n\\t]{0,4}` +
+        `(?:${trailingAlt})${QUANTITY_FOLLOWER_RE}${END}`,
     );
   }
 
