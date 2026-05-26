@@ -100,8 +100,12 @@ const PARTICLE =
   `von|van|dos|ibn|ben|bin|del|zum|zur|ten|ter|` +
   `da|de|di|al|el|le|la|zu|af|av)`;
 
-// Non-newline whitespace
-const SP = "[^\\S\\n\\t]";
+// Non-newline whitespace. Tabs are admitted because
+// DOCX exports routinely place a TAB between an
+// academic title and the following name (table-cell
+// layouts like "Ing.\tStanislav Braňka"); newlines
+// are not, so spans cannot bleed across paragraphs.
+const SP = "[^\\S\\n]";
 
 /** Honorific alternation built from titles.ts config. */
 const HONORIFIC_ALT = [...HONORIFICS]
@@ -454,6 +458,30 @@ const CZ_BIRTH_NUMBER: RegexDef = {
   label: "birth number",
   score: 1,
   validator: cz.rc,
+};
+
+// Czech commercial-register reference. Every Czech
+// legal entity in the public registry is uniquely
+// identified by a registry section letter ("oddíl X")
+// plus an insert number ("vložka NNN"). The full phrase
+// uniquely identifies the company, so we emit it as a
+// single registration-number entity rather than only
+// capturing the trailing digits.
+//
+// Tolerances:
+//   - case-insensitive "oddíl" / "vložka";
+//   - optional whitespace around comma and after each
+//     keyword (DOCX exports add NBSPs and double
+//     spaces);
+//   - section letter is a single A-Z; insert number is
+//     a 1-6 digit integer.
+const CZ_COMMERCIAL_REGISTER: RegexDef = {
+  pattern:
+    `(?i)\\boddíl[^\\S\\n]+[A-Z]` +
+    `[^\\S\\n]*,[^\\S\\n]*` +
+    `vložka[^\\S\\n]+\\d{1,6}\\b`,
+  label: "registration number",
+  score: 0.95,
 };
 
 const DATE_NUMERIC: RegexDef = {
@@ -862,6 +890,7 @@ const ALL_REGEX_DEFS: readonly RegexDef[] = [
   TEL_PREFIX_PHONE,
   CREDIT_CARD,
   CZ_BIRTH_NUMBER,
+  CZ_COMMERCIAL_REGISTER,
   DATE_NUMERIC,
   DATE_CZ_SPACED,
   IP_ADDRESS,
