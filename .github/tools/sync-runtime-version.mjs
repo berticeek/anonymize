@@ -6,6 +6,7 @@ const VERSION_RE = /^[0-9]+\.[0-9]+\.[0-9]+(-(rc|beta|alpha)\.[0-9]+)?$/;
 const PACKAGE_FILES = [
   "packages/anonymize/package.json",
   "packages/anonymize/wasm/package.json",
+  "packages/cli/package.json",
 ];
 
 const checkOnly = process.argv.includes("--check");
@@ -20,19 +21,37 @@ if (!VERSION_RE.test(version)) {
 
 let hasMismatch = false;
 
+// Internal dependency ranges that must track the synced
+// version (the CLI consumes the runtime it ships with).
+const SYNCED_DEPENDENCY = "@stll/anonymize";
+
 for (const file of PACKAGE_FILES) {
   const pkg = JSON.parse(readFileSync(file, "utf8"));
-  if (pkg.version === version) {
+  const wantedRange = `^${version}`;
+  const dependencyRange = pkg.dependencies?.[SYNCED_DEPENDENCY];
+  const dependencyInSync =
+    dependencyRange === undefined || dependencyRange === wantedRange;
+  if (pkg.version === version && dependencyInSync) {
     continue;
   }
 
   if (checkOnly) {
-    console.error(`${file} has version ${pkg.version}; expected ${version}`);
+    if (pkg.version !== version) {
+      console.error(`${file} has version ${pkg.version}; expected ${version}`);
+    }
+    if (!dependencyInSync) {
+      console.error(
+        `${file} depends on ${SYNCED_DEPENDENCY}@${dependencyRange}; expected ${wantedRange}`,
+      );
+    }
     hasMismatch = true;
     continue;
   }
 
   pkg.version = version;
+  if (!dependencyInSync) {
+    pkg.dependencies[SYNCED_DEPENDENCY] = wantedRange;
+  }
   writeFileSync(file, `${JSON.stringify(pkg, null, 2)}\n`);
   console.log(`Updated ${file} to ${version}`);
 }
