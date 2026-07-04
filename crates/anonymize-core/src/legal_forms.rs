@@ -167,10 +167,13 @@ pub(crate) fn process_legal_form_matches(
     if walker_start >= effective_suffix_start {
       continue;
     }
-    if crosses_sentence_end(full_text, walker_start, effective_suffix_start) {
-      continue;
-    }
 
+    // Narrow to the org name before the sentence check. The walker bridges
+    // lowercase words (up to MAX_LOWER_BRIDGE) and can reach back over a verb
+    // clause into a prior sentence ("Initech term sheet. This deed is made by
+    // Initech Corporation"). trim_to_first_cap_after_verb drops that prose, so
+    // the sentence-boundary guard must run on the trimmed span or it rejects a
+    // candidate that would have trimmed cleanly to a single-sentence org.
     let candidate_start = trim_to_first_cap_after_verb(
       full_text,
       walker_start,
@@ -178,6 +181,10 @@ pub(crate) fn process_legal_form_matches(
       data,
     );
     if candidate_start >= effective_suffix_start {
+      continue;
+    }
+    if crosses_sentence_end(full_text, candidate_start, effective_suffix_start)
+    {
       continue;
     }
 
@@ -488,7 +495,17 @@ fn crosses_sentence_end(text: &str, start: usize, suffix_start: usize) -> bool {
 
   for ch in slice.chars() {
     if ch.is_uppercase() {
-      uppercase_run = uppercase_run.saturating_add(1);
+      // An interior dot delimits a word, so a capital right after one starts
+      // a fresh run. This keeps compact initials ("J.P.") from looking like a
+      // two-letter acronym followed by a sentence break, while a real acronym
+      // ("INC.") still accumulates its run before the trailing period. The
+      // lowercase branch below already gates on the previous char, so only the
+      // uppercase run needs this guard.
+      uppercase_run = if previous == Some('.') {
+        1
+      } else {
+        uppercase_run.saturating_add(1)
+      };
       lowercase_run = 0;
       previous = Some(ch);
       continue;
@@ -1403,7 +1420,14 @@ fn trim_leading_clause(
   text: &str,
   data: &PreparedLegalFormData,
 ) -> LeadingTrim {
-  let lower = text.to_lowercase();
+  // Search on a lowercased copy for case-insensitive matching, but keep a map
+  // back to original byte offsets. `to_lowercase()` can change byte lengths
+  // ("İ" U+0130 -> "i" + U+0307), so any offset taken from `lower` must be
+  // translated before it is used to slice the original `text` or returned as a
+  // cut (the caller slices the original with it).
+  let (lower, lower_to_orig) = lowercase_with_offset_map(text);
+  let to_orig =
+    |offset: usize| lower_to_orig.get(offset).copied().unwrap_or(text.len());
   let mut cut = 0_usize;
 
   for phrase in &data.leading_clause_phrases {
@@ -1421,7 +1445,7 @@ fn trim_leading_clause(
           .is_some_and(char::is_whitespace);
       let after_ws = lower.get(end..).map(leading_ws_len).unwrap_or_default();
       if before_ok && after_ws > 0 {
-        cut = cut.max(end.saturating_add(after_ws));
+        cut = cut.max(to_orig(end.saturating_add(after_ws)));
       }
     }
   }
@@ -1436,14 +1460,18 @@ fn trim_leading_clause(
       let end = start.saturating_add(prefix.len());
       search_from = end;
       let after_ws = lower.get(end..).map(leading_ws_len).unwrap_or_default();
-      let after = lower
-        .get(end.saturating_add(after_ws)..)
+      let after_orig = to_orig(end.saturating_add(after_ws));
+      // The company name after the prefix must be capitalized. Read the
+      // original text (in original byte offsets), not the lowercased copy, or
+      // this check never passes.
+      let after = text
+        .get(after_orig..)
         .and_then(|suffix| suffix.chars().next());
       if after_ws == 0 || !after.is_some_and(char::is_uppercase) {
         continue;
       }
 
-      let before = text.get(..start).unwrap_or_default();
+      let before = text.get(..to_orig(start)).unwrap_or_default();
       let prefix_lower = prefix.to_lowercase();
       if data.comma_gated_direct_prefixes.contains(&prefix_lower) {
         let has_comma = before.trim_end().ends_with(',');
@@ -1467,7 +1495,7 @@ fn trim_leading_clause(
       }
       let has_prose_prefix = word_count >= 3 && has_lower_word;
       if has_prose_prefix {
-        cut = cut.max(end.saturating_add(after_ws));
+        cut = cut.max(after_orig);
       }
     }
   }
@@ -1489,6 +1517,25 @@ fn trim_leading_clause(
   }
 
   LeadingTrim { offset: cut }
+}
+
+/// Lowercase `text`, returning the folded string plus a table that maps each
+/// byte offset in the folded string back to the byte offset of the original
+/// character that produced it. The final entry maps the end of the folded
+/// string to `text.len()`. Case folding can change byte lengths, so offsets
+/// found in the folded copy must be translated through this table before they
+/// index or slice the original text.
+fn lowercase_with_offset_map(text: &str) -> (String, Vec<usize>) {
+  let mut lower = String::with_capacity(text.len());
+  let mut lower_to_orig = Vec::with_capacity(text.len().saturating_add(1));
+  for (orig_idx, ch) in text.char_indices() {
+    for folded in ch.to_lowercase() {
+      lower.push(folded);
+      lower_to_orig.resize(lower.len(), orig_idx);
+    }
+  }
+  lower_to_orig.push(text.len());
+  (lower, lower_to_orig)
 }
 
 fn find_word_at_boundary(haystack: &str, needle: &str) -> Option<usize> {
@@ -1719,4 +1766,113 @@ fn lowercase_lookup(text: &str) -> Cow<'_, str> {
 
 fn contains_lowercase(set: &HashSet<String>, text: &str) -> bool {
   set.contains(lowercase_lookup(text).as_ref())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{
+    LegalFormData, PreparedLegalFormData, crosses_sentence_end,
+    trim_leading_clause,
+  };
+
+  fn leading_clause_data() -> PreparedLegalFormData {
+    PreparedLegalFormData::new(LegalFormData {
+      leading_clause_phrases: vec![
+        String::from("by and among"),
+        String::from("by and between"),
+        String::from("is between"),
+      ],
+      leading_clause_direct_prefixes: vec![
+        String::from("by"),
+        String::from("among"),
+        String::from("amongst"),
+        String::from("between"),
+      ],
+      comma_gated_direct_prefixes: vec![
+        String::from("among"),
+        String::from("amongst"),
+        String::from("between"),
+      ],
+      ..LegalFormData::default()
+    })
+  }
+
+  #[test]
+  fn comma_gated_prefix_trims_long_preamble() {
+    // A long comma-laden preamble before a comma-gated direct prefix must trim
+    // back to the company name, not drop the whole candidate. The capital-word
+    // check after the prefix has to read the original text, not the lowercased
+    // copy, or it never fires.
+    let data = leading_clause_data();
+    let text =
+      "Investment Agreement, dated as of March 9, 2020, among Twitter, Inc.";
+    let trim = trim_leading_clause(text, &data);
+    assert_eq!(text.get(trim.offset..), Some("Twitter, Inc."));
+  }
+
+  #[test]
+  fn direct_prefix_offset_survives_turkish_dotted_capital() {
+    // `to_lowercase()` expands "İ" (U+0130) to "i" + U+0307, so a byte offset
+    // taken from the lowercased copy drifts one byte past the original once an
+    // İ precedes the clause. The recovered company name must be sliced in
+    // original-text space: the Turkish input yields the same result as its
+    // ASCII twin, with no mis-slice, panic, or None-degradation.
+    let data = leading_clause_data();
+    let ascii = "Istanbul Holding A.S. Investment Agreement, dated as of March 9, 2020, among Twitter, Inc.";
+    let turkish = "İstanbul Holding A.Ş. Investment Agreement, dated as of March 9, 2020, among Twitter, Inc.";
+    let ascii_trim = trim_leading_clause(ascii, &data);
+    let turkish_trim = trim_leading_clause(turkish, &data);
+    assert_eq!(ascii.get(ascii_trim.offset..), Some("Twitter, Inc."));
+    assert_eq!(turkish.get(turkish_trim.offset..), Some("Twitter, Inc."));
+  }
+
+  #[test]
+  fn comma_gated_prefix_keeps_in_name_capitalised_word() {
+    // "Stand By Me LLC": "By" is capitalized and mid-name, and the text before
+    // it is not prose, so the direct prefix must not trim.
+    let data = leading_clause_data();
+    let text = "Stand By Me LLC";
+    let trim = trim_leading_clause(text, &data);
+    assert_eq!(trim.offset, 0);
+  }
+
+  fn crosses(text: &str, prefix: &str) -> bool {
+    // Treat the org candidate as spanning the whole text up to the trailing
+    // legal-form suffix (the caller passes walker_start and suffix_start).
+    let suffix_start = text.rfind(prefix).unwrap_or(text.len());
+    crosses_sentence_end(text, 0, suffix_start)
+  }
+
+  #[test]
+  fn compact_initials_are_not_a_sentence_break() {
+    // "J.P. Morgan Securities LLC" — the interior dot must not make "J.P."
+    // read as a two-letter acronym followed by a sentence end.
+    assert!(!crosses("J.P. Morgan Securities LLC", "LLC"));
+    assert!(!crosses("U.S. Robotics Corp LLC", "LLC"));
+  }
+
+  #[test]
+  fn dotted_geo_acronym_joins_like_a_name_initial() {
+    // A two-letter dotted acronym is structurally identical whether it is a
+    // geographic prefix ("U.S. Bancorp Inc.") or a person-name initial ("J.P.
+    // Morgan Securities LLC"). The recovered TypeScript detector absorbed both
+    // unconditionally (skipInitialsBackward: `(?:\p{Lu}\.\s?){2,}`, no
+    // known-acronym exception list), so "U.S. Beta LLC" joins the same way.
+    // Splitting it would regress the real "U.S. Bancorp"/"U.S. Robotics"
+    // orgs, which share the exact same shape.
+    assert!(!crosses("U.S. Beta LLC", "LLC"));
+    assert!(!crosses("U.S. Bancorp Inc.", "Inc."));
+  }
+
+  #[test]
+  fn spaced_initials_stay_a_single_candidate() {
+    assert!(!crosses("J. P. Morgan Securities LLC", "LLC"));
+  }
+
+  #[test]
+  fn genuine_sentence_break_still_detected() {
+    // A real 2+ letter word (any case) before ". " remains a boundary.
+    assert!(crosses("Price. LLC", "LLC"));
+    assert!(crosses("Acme INC. Beta LLC", "LLC"));
+  }
 }
