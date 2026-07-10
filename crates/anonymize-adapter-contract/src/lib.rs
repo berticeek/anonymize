@@ -30,7 +30,7 @@ pub use assemble::{
 
 pub type Result<T> = std::result::Result<T, ContractError>;
 
-pub const CALLER_DETECTION_CONTRACT_VERSION: u32 = 1;
+pub const CALLER_DETECTION_CONTRACT_VERSION: u32 = 2;
 
 const PREPARED_SEARCH_PACKAGE_HEADER: [u8; 8] = *b"ANONPKG1";
 const PREPARED_SEARCH_PACKAGE_VERSION: u32 = 15;
@@ -123,6 +123,8 @@ pub struct BindingCallerDetection {
   pub end: u32,
   pub label: String,
   pub score: f64,
+  pub provider_id: String,
+  pub detection_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -151,6 +153,8 @@ pub fn caller_detections_from_binding(
         end: detection.end,
         label: detection.label,
         score: detection.score,
+        provider_id: detection.provider_id,
+        detection_id: detection.detection_id,
       })
       .map_err(|error| ContractError::InvalidCallerDetection {
         index,
@@ -868,6 +872,8 @@ pub const fn diagnostic_stage_event(
     pattern: None,
     source: None,
     source_detail: None,
+    provider_id: None,
+    detection_id: None,
     label: None,
     start: None,
     end: None,
@@ -1713,6 +1719,10 @@ pub struct BindingPipelineEntity {
   pub score: f64,
   pub source: String,
   pub source_detail: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub provider_id: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub detection_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1757,6 +1767,10 @@ pub struct BindingDiagnosticEvent {
   pub source: Option<String>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub source_detail: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub provider_id: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub detection_id: Option<String>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub label: Option<String>,
   #[serde(skip_serializing_if = "Option::is_none")]
@@ -2630,6 +2644,7 @@ pub fn static_redaction_stream_event_to_utf16_binding(
 fn binding_pipeline_entity_from_core(
   entity: PipelineEntity,
 ) -> BindingPipelineEntity {
+  let provenance = entity.caller_provenance;
   BindingPipelineEntity {
     start: entity.start,
     end: entity.end,
@@ -2638,6 +2653,12 @@ fn binding_pipeline_entity_from_core(
     score: entity.score,
     source: detection_source_name(entity.source),
     source_detail: entity.source_detail.map(source_detail_name),
+    provider_id: provenance
+      .as_ref()
+      .map(|value| value.provider_id().to_owned()),
+    detection_id: provenance
+      .as_ref()
+      .map(|value| value.detection_id().to_owned()),
   }
 }
 
@@ -2652,6 +2673,14 @@ fn binding_pipeline_entity_from_core_ref(
     score: entity.score,
     source: detection_source_name(entity.source),
     source_detail: entity.source_detail.map(source_detail_name),
+    provider_id: entity
+      .caller_provenance
+      .as_ref()
+      .map(|value| value.provider_id().to_owned()),
+    detection_id: entity
+      .caller_provenance
+      .as_ref()
+      .map(|value| value.detection_id().to_owned()),
   }
 }
 
@@ -2729,6 +2758,23 @@ pub fn static_redaction_diagnostic_result_to_utf16_binding(
   Ok(result)
 }
 
+pub fn static_redaction_diagnostic_result_to_character_binding(
+  result: StaticRedactionDiagnosticResult,
+  full_text: &str,
+) -> Result<BindingStaticRedactionDiagnosticResult> {
+  let offsets = CharacterOffsetMap::new(full_text)?;
+  let mut result = static_redaction_diagnostic_result_to_binding(result);
+  convert_pipeline_entity_character_offsets(
+    &mut result.result.resolved_entities,
+    &offsets,
+  )?;
+  convert_diagnostic_character_offsets(
+    &mut result.diagnostics.events,
+    &offsets,
+  )?;
+  Ok(result)
+}
+
 #[must_use]
 pub fn static_redaction_diagnostics_to_binding(
   diagnostics: StaticRedactionDiagnostics,
@@ -2791,6 +2837,8 @@ fn diagnostic_event_to_binding(
     pattern: event.pattern,
     source: event.source.map(detection_source_name),
     source_detail: event.source_detail.map(source_detail_name),
+    provider_id: event.provider_id,
+    detection_id: event.detection_id,
     label: event.label,
     start: event.start,
     end: event.end,
@@ -2819,6 +2867,32 @@ fn convert_pipeline_entity_offsets(
 fn convert_diagnostic_offsets(
   events: &mut [BindingDiagnosticEvent],
   offsets: &Utf16OffsetMap,
+) -> Result<()> {
+  for event in events {
+    if let Some(start) = event.start {
+      event.start = Some(offsets.convert(start)?);
+    }
+    if let Some(end) = event.end {
+      event.end = Some(offsets.convert(end)?);
+    }
+  }
+  Ok(())
+}
+
+fn convert_pipeline_entity_character_offsets(
+  entities: &mut [BindingPipelineEntity],
+  offsets: &CharacterOffsetMap,
+) -> Result<()> {
+  for entity in entities {
+    entity.start = offsets.convert(entity.start)?;
+    entity.end = offsets.convert(entity.end)?;
+  }
+  Ok(())
+}
+
+fn convert_diagnostic_character_offsets(
+  events: &mut [BindingDiagnosticEvent],
+  offsets: &CharacterOffsetMap,
 ) -> Result<()> {
   for event in events {
     if let Some(start) = event.start {
@@ -2936,6 +3010,23 @@ impl CharacterOffsetMap {
       })
       .ok_or(ContractError::InvalidBindingOffset {
         offset: character_offset,
+      })
+  }
+
+  fn convert(&self, byte_offset: u32) -> Result<u32> {
+    let index = self
+      .boundaries
+      .binary_search_by_key(&byte_offset, |(offset, _)| *offset)
+      .ok();
+    index
+      .and_then(|index| {
+        self
+          .boundaries
+          .get(index)
+          .map(|(_, character_offset)| *character_offset)
+      })
+      .ok_or(ContractError::InvalidBindingOffset {
+        offset: byte_offset,
       })
   }
 }
@@ -3374,6 +3465,7 @@ fn diagnostic_stage_name(stage: DiagnosticStage) -> String {
     | DiagnosticStage::SearchTrigger
     | DiagnosticStage::SearchLiteral => diagnostic_search_stage_name(stage),
     DiagnosticStage::DetectTotal
+    | DiagnosticStage::EntityCallerInput
     | DiagnosticStage::EntityRegex
     | DiagnosticStage::EntityCustomRegex
     | DiagnosticStage::EntityAnchored
@@ -3405,6 +3497,7 @@ fn diagnostic_stage_name(stage: DiagnosticStage) -> String {
       diagnostic_detect_stage_name(stage)
     }
     DiagnosticStage::EntityZoneAdjustment
+    | DiagnosticStage::EntityCallerRetained
     | DiagnosticStage::EntityHotword
     | DiagnosticStage::EntityAddressContext
     | DiagnosticStage::EntityCoreference
@@ -3487,6 +3580,7 @@ const fn diagnostic_search_stage_name(stage: DiagnosticStage) -> &'static str {
 const fn diagnostic_detect_stage_name(stage: DiagnosticStage) -> &'static str {
   match stage {
     DiagnosticStage::DetectTotal => "detect.total",
+    DiagnosticStage::EntityCallerInput => "entity.caller.input",
     DiagnosticStage::EntityRegex => "entity.regex",
     DiagnosticStage::EntityCustomRegex => "entity.custom-regex",
     DiagnosticStage::EntityAnchored => "entity.anchored",
@@ -3534,6 +3628,7 @@ const fn diagnostic_detect_stage_name(stage: DiagnosticStage) -> &'static str {
 const fn diagnostic_finish_stage_name(stage: DiagnosticStage) -> &'static str {
   match stage {
     DiagnosticStage::EntityZoneAdjustment => "entity.zone-adjustment",
+    DiagnosticStage::EntityCallerRetained => "entity.caller.retained",
     DiagnosticStage::EntityHotword => "entity.hotword",
     DiagnosticStage::EntityAddressContext => "entity.address-context",
     DiagnosticStage::EntityCoreference => "entity.coreference",
@@ -3618,6 +3713,8 @@ mod tests {
           end: 5,
           label: String::from("person"),
           score: 0.9,
+          provider_id: String::from("test-provider"),
+          detection_id: String::from("person-1"),
         }],
       })
       .unwrap();
@@ -3646,6 +3743,8 @@ mod tests {
         end: 2,
         label: String::from("person"),
         score: 0.9,
+        provider_id: String::from("test-provider"),
+        detection_id: String::from("person-1"),
       }],
     })
     .unwrap_err();
@@ -3666,6 +3765,8 @@ mod tests {
           end: 2,
           label: String::from("person"),
           score: 0.9,
+          provider_id: String::from("test-provider"),
+          detection_id: String::from("person-1"),
         }],
       },
       "😀Alice",
@@ -3683,6 +3784,7 @@ mod tests {
     let text = "😀Alice";
     assert_eq!(Utf16OffsetMap::new(text).unwrap().byte_offset(2), Ok(4));
     assert_eq!(CharacterOffsetMap::new(text).unwrap().byte_offset(1), Ok(4));
+    assert_eq!(CharacterOffsetMap::new(text).unwrap().convert(4), Ok(1));
   }
   use stella_anonymize_core::{
     DiagnosticEvent, DiagnosticEventKind, DiagnosticStage,
@@ -3895,6 +3997,8 @@ mod tests {
         pattern: None,
         source: None,
         source_detail: None,
+        provider_id: None,
+        detection_id: None,
         label: None,
         start: Some(1),
         end: Some(2),
@@ -3995,6 +4099,8 @@ mod tests {
         pattern: None,
         source: None,
         source_detail: None,
+        provider_id: None,
+        detection_id: None,
         label: Some("name".to_string()),
         start: Some(0),
         end: Some(2),

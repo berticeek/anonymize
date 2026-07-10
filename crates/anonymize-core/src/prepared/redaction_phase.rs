@@ -21,11 +21,22 @@ impl PreparedEngine {
     event_stream: &mut DiagnosticEventStream<'_>,
     result_stream: &mut StaticRedactionResultStream<'_>,
   ) -> Result<StaticRedactionResult> {
+    validate_unique_caller_provenance(caller_detections)?;
     let caller_entities = caller_detections
       .iter()
       .cloned()
       .map(|detection| detection.into_pipeline_entity(full_text))
       .collect::<Result<Vec<_>>>()?;
+    if !caller_entities.is_empty()
+      && let Some(diagnostics) = diagnostics.as_deref_mut()
+    {
+      diagnostics.record_entities(
+        crate::diagnostics::DiagnosticStage::EntityCallerInput,
+        &caller_entities,
+        full_text,
+        None,
+      );
+    }
     let redact_timer = PhaseTimer::start();
     let detections = self
       .detect_static_entities_inner(full_text, diagnostics.as_deref_mut())?;
@@ -39,6 +50,34 @@ impl PreparedEngine {
       &mut diagnostics,
       event_stream,
     )?;
+    if !caller_entities.is_empty()
+      && let Some(diagnostics) = diagnostics.as_deref_mut()
+    {
+      if diagnostics.detail == crate::diagnostics::DiagnosticDetail::Summary {
+        let retained_count = resolved_entities
+          .iter()
+          .filter(|entity| entity.caller_provenance.is_some())
+          .count();
+        diagnostics.record_stage(
+          crate::diagnostics::DiagnosticStage::EntityCallerRetained,
+          Some(retained_count),
+          None,
+          Some(full_text.len()),
+        );
+      } else {
+        let retained_caller_entities = resolved_entities
+          .iter()
+          .filter(|entity| entity.caller_provenance.is_some())
+          .cloned()
+          .collect::<Vec<_>>();
+        diagnostics.record_entities(
+          crate::diagnostics::DiagnosticStage::EntityCallerRetained,
+          &retained_caller_entities,
+          full_text,
+          None,
+        );
+      }
+    }
     result_stream.observe(StaticRedactionStreamEvent::ResolvedEntities(
       &resolved_entities,
     ))?;
@@ -64,6 +103,24 @@ impl PreparedEngine {
       redaction,
     })
   }
+}
+
+fn validate_unique_caller_provenance(
+  detections: &[CallerDetection],
+) -> Result<()> {
+  let mut identities = std::collections::BTreeSet::new();
+  for detection in detections {
+    let provenance = detection.provenance();
+    if identities.insert((provenance.provider_id(), provenance.detection_id()))
+    {
+      continue;
+    }
+    return Err(crate::types::Error::InvalidCallerDetection {
+      field: "detection_id",
+      reason: String::from("duplicate provider_id/detection_id pair"),
+    });
+  }
+  Ok(())
 }
 
 fn record_redaction_stages(
