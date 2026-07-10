@@ -201,7 +201,17 @@ export type TriggerRule = {
   includeTrigger: boolean;
 };
 
-export { OPERATOR_TYPES, type OperatorType } from "./constants";
+export {
+  ENTITY_CAPABILITIES,
+  ENTITY_LABELS,
+  ENTITY_SELECTIONS,
+  OPERATOR_TYPES,
+  type DefaultEntityLabel,
+  type EntityCapability,
+  type EntityLabel,
+  type EntitySelection,
+  type OperatorType,
+} from "./constants";
 
 /** Per-label operator selection. Key is the entity label. */
 export type OperatorConfig = {
@@ -417,15 +427,21 @@ export type PipelineConfig = {
    * additions (Dutch, Russian, Chinese, Arabic, etc.).
    */
   enableCountries?: boolean;
-  enableNer: boolean;
+  /**
+   * Reserved for compatibility with the removed TypeScript pipeline.
+   * The native pipeline rejects `true`; supply deterministic custom rules today
+   * and use the future caller-detection API for model-produced spans.
+   *
+   * @deprecated Native NER is not implemented.
+   */
+  enableNer?: boolean;
   enableConfidenceBoost: boolean;
   enableCoreference: boolean;
   enableZoneClassification?: boolean;
   enableHotwordRules?: boolean;
   /**
    * Requested output labels. An empty array means
-   * "do not filter by label" for deterministic
-   * detectors; NER falls back to DEFAULT_ENTITY_LABELS.
+   * "do not filter by label" for deterministic detectors.
    */
   labels: string[];
   workspaceId: string;
