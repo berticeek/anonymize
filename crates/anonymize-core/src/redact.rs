@@ -11,8 +11,8 @@ use crate::session::{
 };
 use crate::types::{
   Entity, EntityKind, MaskConfig, MaskDirection, Operator, OperatorConfig,
-  OperatorEntry, OperatorType, PlaceholderMap, RedactionEntry, RedactionResult,
-  Result,
+  OperatorEntry, OperatorType, PlaceholderMap, RedactionEntry,
+  RedactionReplacement, RedactionResult, Result,
 };
 
 pub fn redact_text(
@@ -83,6 +83,7 @@ fn redact_text_inner(
       redacted_text: full_text.to_owned(),
       redaction_map: Vec::new(),
       operator_map: Vec::new(),
+      replacements: Vec::new(),
       entity_count: 0,
     });
   }
@@ -171,6 +172,7 @@ fn redact_text_inner(
     redacted_text: rendered.text,
     redaction_map: rendered.map,
     operator_map,
+    replacements: rendered.replacements,
     entity_count: kept
       .len()
       .saturating_add(masked.len())
@@ -241,7 +243,34 @@ struct RenderOptions<'text, 'config, 'borrow> {
 struct RenderedRedactions {
   text: String,
   map: Vec<RedactionEntry>,
+  replacements: Vec<RedactionReplacement>,
   placeholder_counts: BTreeMap<String, usize>,
+}
+
+struct RenderedReplacementOutput {
+  text: String,
+  replacements: Vec<RedactionReplacement>,
+}
+
+impl RenderedReplacementOutput {
+  fn push(&mut self, replacement: RedactionReplacement) {
+    self.text.push_str(&replacement.replacement);
+    self.replacements.push(replacement);
+  }
+
+  fn push_source(
+    &mut self,
+    options: &RenderOptions<'_, '_, '_>,
+    (start, end): (u32, u32),
+  ) -> Result<()> {
+    self.text.push_str(source_slice(
+      options.full_text,
+      options.offsets,
+      start,
+      end,
+    )?);
+    Ok(())
+  }
 }
 
 impl RenderedRedactions {
@@ -270,7 +299,10 @@ enum NextSpan<'borrow, 'text, 'config> {
 fn render_selected_spans(
   options: &RenderOptions<'_, '_, '_>,
 ) -> Result<RenderedRedactions> {
-  let mut text = String::with_capacity(options.full_text.len());
+  let mut output = RenderedReplacementOutput {
+    text: String::with_capacity(options.full_text.len()),
+    replacements: Vec::new(),
+  };
   let mut map = Vec::<RedactionEntry>::new();
   let mut placeholders = HashSet::<String>::new();
   let mut placeholder_counts = BTreeMap::<String, usize>::new();
@@ -295,17 +327,16 @@ fn render_selected_spans(
       NextSpan::Mask(span) => (span.start, span.end),
     };
     if start > cursor {
-      text.push_str(source_slice(
-        options.full_text,
-        options.offsets,
-        cursor,
-        start,
-      )?);
+      output.push_source(options, (cursor, start))?;
     }
 
     match next {
       NextSpan::Mask(span) => {
-        text.push_str(span.masking_character);
+        output.push(RedactionReplacement {
+          start,
+          end,
+          replacement: span.masking_character.to_owned(),
+        });
         mask_index = mask_index.saturating_add(1);
       }
       NextSpan::Redacted(span) => {
@@ -316,21 +347,26 @@ fn render_selected_spans(
             Cow::Borrowed,
           );
         let operator = operator_for(options.config, &entity.label);
-        match operator {
+        let replacement = match operator {
           Operator::Replace => {
-            text.push_str(&placeholder);
             if options.track_placeholder_counts {
               let count = placeholder_counts
                 .entry(placeholder.to_string())
                 .or_insert(0);
               *count = count.saturating_add(1);
             }
+            Some(placeholder.to_string())
           }
-          Operator::Redact => text.push_str(&options.config.redact_string),
-          Operator::Mask(mask) => {
-            text.push_str(&mask_text(span.source_text, mask));
-          }
-          Operator::Keep => {}
+          Operator::Redact => Some(options.config.redact_string.clone()),
+          Operator::Mask(mask) => Some(mask_text(span.source_text, mask)),
+          Operator::Keep => None,
+        };
+        if let Some(replacement) = replacement {
+          output.push(RedactionReplacement {
+            start,
+            end,
+            replacement,
+          });
         }
         if operator == &Operator::Replace
           && !placeholders.contains(placeholder.as_ref())
@@ -350,16 +386,12 @@ fn render_selected_spans(
 
   let full_text_len = options.offsets.len()?;
   if cursor < full_text_len {
-    text.push_str(source_slice(
-      options.full_text,
-      options.offsets,
-      cursor,
-      full_text_len,
-    )?);
+    output.push_source(options, (cursor, full_text_len))?;
   }
   Ok(RenderedRedactions {
-    text,
+    text: output.text,
     map,
+    replacements: output.replacements,
     placeholder_counts,
   })
 }
