@@ -15,6 +15,16 @@ const BR_CEP_CONTEXT_WINDOW: usize = 200;
 const PLAIN_POSTAL_CONTEXT_WINDOW: usize = 120;
 const US_ZIP_CONTEXT_WINDOW: usize = 120;
 
+/// Lowercase connective particles that commonly sit inside street names
+/// ("rue de la Paix", "van der Hoopstraat", "calle de los Reyes").
+/// Deliberately a closed set: the delayed-house-number bridge in
+/// `house_number_after_street_re` may only cross these particles plus a
+/// single street-name word, so arbitrary prose ("rue is a French word
+/// 12345") cannot connect a street word to a distant number.
+const STREET_PARTICLE_ALTERNATION: &str = "de|del|della|delle|dei|degli|der\
+|den|des|di|du|da|das|dos|do|el|al|la|le|les|las|los|van|von|ten|ter|op|aan\
+|am|an|im|zum|zur";
+
 #[derive(
   Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize,
 )]
@@ -84,9 +94,18 @@ impl PreparedAddressSeedData {
       house_number_before_street_re: compile_regex(
         r"(?u)\b\d{1,6}(?:[-/]\d{1,6})?\s+(?:\p{Lu}\p{L}+[^\S\n\t]+){0,4}$",
       )?,
-      house_number_after_street_re: compile_regex(
-        r"(?u)^[^\S\n\t]+\d{1,6}(?:[-/]\d{1,6})?\b",
-      )?,
+      // Mirrors `house_number_before_street_re`'s tolerance for a short run
+      // of intervening words (e.g. "rue de la Paix 10", where the house
+      // number trails the street word) instead of requiring the digits to
+      // sit immediately after the street word. Like the "before" variant
+      // (which only tolerates `\p{Lu}\p{L}+` words), the bridge is
+      // restricted: up to three known street-name particles plus at most
+      // one capitalized street-name word directly ahead of the number, so
+      // ordinary prose ("rue is a French word 12345", "Road docket
+      // 94304-1050") cannot supply house-number evidence.
+      house_number_after_street_re: compile_regex(&format!(
+        r"(?u)^[^\S\n\t]+(?:(?i:{STREET_PARTICLE_ALTERNATION})[^\S\n\t]+){{0,3}}(?:\p{{Lu}}\p{{L}}+[^\S\n\t]+)?\d{{1,6}}(?:[-/]\d{{1,6}})?\b"
+      ))?,
     })
   }
 
@@ -790,9 +809,12 @@ fn has_house_number_near_street_word(
     return true;
   }
 
+  // Widened from 24 to accommodate the bounded intervening-word tolerance
+  // added to `house_number_after_street_re` (up to 3 street-name particles
+  // plus one street-name word before the house number).
   let after_end = ceil_char_boundary(
     full_text,
-    seed.end.saturating_add(24).min(full_text.len()),
+    seed.end.saturating_add(60).min(full_text.len()),
   );
   let after = full_text.get(seed.end..after_end).unwrap_or_default();
   data.house_number_after_street_re.is_match(after)
@@ -1626,6 +1648,101 @@ mod tests {
         .any(|entity| entity.text == "Bismarckring 18, 65183 Wiesbaden"),
       "address seed entities: {result:?}",
     );
+    Ok(())
+  }
+
+  #[test]
+  fn lowercase_street_word_with_distant_house_number_counts_as_evidence()
+  -> Result<()> {
+    // "rue de la Paix 10": the house number trails the (lowercase) street
+    // word by two particles and the street-name word, mirroring the bounded
+    // intervening-word tolerance `house_number_before_street_re` already
+    // gives capitalized words ahead of a street word.
+    let data = PreparedAddressSeedData::new(AddressSeedData::default())?;
+    let full_text = "rue de la Paix 10";
+    let seed = Seed {
+      kind: SeedType::StreetWord,
+      start: 0,
+      end: 3,
+      text: String::from("rue"),
+    };
+
+    assert!(
+      has_house_number_near_street_word(full_text, &seed, &data),
+      "a house number three bridge words after the street word should count as nearby evidence"
+    );
+    assert!(
+      !is_lowercase_street_word_in_prose(full_text, &seed, &data),
+      "rue should not be suppressed as bare lowercase prose once a trailing house number is recognized"
+    );
+
+    Ok(())
+  }
+
+  #[test]
+  fn lowercase_street_word_without_house_number_is_still_treated_as_prose()
+  -> Result<()> {
+    let data = PreparedAddressSeedData::new(AddressSeedData::default())?;
+    let full_text = "rue is a French word for street, not an address here";
+    let seed = Seed {
+      kind: SeedType::StreetWord,
+      start: 0,
+      end: 3,
+      text: String::from("rue"),
+    };
+
+    assert!(
+      !has_house_number_near_street_word(full_text, &seed, &data),
+      "no house number is nearby, so the widened regex should still not match"
+    );
+    assert!(
+      is_lowercase_street_word_in_prose(full_text, &seed, &data),
+      "rue used as a plain word with no nearby house number should still be treated as prose"
+    );
+
+    Ok(())
+  }
+
+  #[test]
+  fn prose_words_do_not_bridge_street_word_to_distant_number() -> Result<()> {
+    // The delayed-house-number bridge only crosses street-name particles
+    // (de, la, van, ...) plus at most one street-name word. Arbitrary prose
+    // between the street word and a number must not count as house-number
+    // evidence; otherwise a trailing figure in an explanatory sentence
+    // would defeat the lowercase-prose suppression.
+    let data = PreparedAddressSeedData::new(AddressSeedData::default())?;
+    let full_text = "rue is a French word 12345";
+    let seed = Seed {
+      kind: SeedType::StreetWord,
+      start: 0,
+      end: 3,
+      text: String::from("rue"),
+    };
+
+    assert!(
+      !has_house_number_near_street_word(full_text, &seed, &data),
+      "prose words must not bridge a street word to a distant number"
+    );
+    assert!(
+      is_lowercase_street_word_in_prose(full_text, &seed, &data),
+      "rue followed by prose and an unrelated number should stay suppressed as prose"
+    );
+
+    // A single lowercase word must not bridge either ("Road docket
+    // 94304-1050" is a docket identifier, not a house number); only the
+    // capitalized street-name slot may sit directly ahead of the digits.
+    let docket_text = "The Road docket 94304-1050 is closed.";
+    let docket_seed = Seed {
+      kind: SeedType::StreetWord,
+      start: 4,
+      end: 8,
+      text: String::from("Road"),
+    };
+    assert!(
+      !has_house_number_near_street_word(docket_text, &docket_seed, &data),
+      "a lowercase non-particle word must not bridge to a ZIP-shaped number"
+    );
+
     Ok(())
   }
 }

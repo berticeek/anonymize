@@ -175,6 +175,79 @@ fn structured_regex_span_beats_sentence_final_trigger_fragment() {
 }
 
 #[test]
+fn structured_phone_regex_beats_truncated_trigger_with_swept_prefix() {
+  // The trigger's padding sweeps in a leading text prefix, so the trigger
+  // starts before the regex match. The trigger's own capture cap then
+  // truncates it before the regex's end. The regex never left-contains the
+  // trigger here (it starts later), but it still extends further right, so
+  // it must win or the untruncated phone-number suffix leaks.
+  let full_text = "Telefon: 604 123 456";
+  let regex_start = byte_len("Telefon: ");
+  let regex_text = "604 123 456";
+  let trigger_text = "Telefon: 604 123";
+  let result = merge_and_dedup(&[
+    PipelineEntity::detected(
+      regex_start,
+      regex_start + byte_len(regex_text),
+      "phone number",
+      regex_text,
+      0.9,
+      DetectionSource::Regex,
+    ),
+    PipelineEntity::detected(
+      0,
+      byte_len(trigger_text),
+      "phone number",
+      trigger_text,
+      0.95,
+      DetectionSource::Trigger,
+    ),
+  ]);
+
+  assert_eq!(result.len(), 1);
+  let kept = result.first().expect("result");
+  assert_eq!(kept.source, DetectionSource::Regex);
+  assert_eq!(kept.start, regex_start);
+  assert_eq!(kept.end, regex_start + byte_len(regex_text));
+  assert_eq!(kept.end, byte_len(full_text));
+}
+
+#[test]
+fn later_starting_regex_does_not_evict_trigger_holding_value_digits() {
+  // Unlike the swept-prefix case above (where the uncovered trigger prefix
+  // is the label padding "Telefon: "), here the trigger prefix the regex
+  // leaves uncovered carries leading value digits ("+420 "): the regex
+  // shape only matched the national part. Evicting the trigger would leave
+  // that country-code head unredacted, so the trigger must win.
+  let trigger_text = "+420 604 123";
+  let regex_text = "604 123 456";
+  let regex_start = byte_len("+420 ");
+  let result = merge_and_dedup(&[
+    PipelineEntity::detected(
+      regex_start,
+      regex_start + byte_len(regex_text),
+      "phone number",
+      regex_text,
+      0.9,
+      DetectionSource::Regex,
+    ),
+    PipelineEntity::detected(
+      0,
+      byte_len(trigger_text),
+      "phone number",
+      trigger_text,
+      0.95,
+      DetectionSource::Trigger,
+    ),
+  ]);
+
+  assert_eq!(result.len(), 1);
+  let kept = result.first().expect("result");
+  assert_eq!(kept.source, DetectionSource::Trigger);
+  assert_eq!(kept.start, 0);
+}
+
+#[test]
 fn structured_date_regex_span_beats_trigger_fragment() {
   let regex_text = "21. März 1968";
   let trigger_text = "21.";
@@ -320,7 +393,9 @@ fn address_component_beats_low_confidence_name_collision() {
 
 #[test]
 fn caller_owned_boundaries_win_overlap_resolution() {
-  let mut custom = entity(DetectionSource::Regex, 0.5, 0, 8, "person");
+  // The custom span is not narrower than the overlapping built-in trigger
+  // span, so caller/custom ownership still wins the overlap.
+  let mut custom = entity(DetectionSource::Regex, 0.5, 0, 12, "person");
   custom.source_detail = Some(SourceDetail::CustomRegex);
   let result = merge_and_dedup(&[
     entity(DetectionSource::Trigger, 0.99, 0, 10, "person"),
@@ -332,6 +407,87 @@ fn caller_owned_boundaries_win_overlap_resolution() {
     result.first().expect("result").source_detail,
     Some(SourceDetail::CustomRegex)
   );
+}
+
+#[test]
+fn narrower_custom_span_does_not_evict_wider_built_in_span() {
+  // Mirror image of the case above: a narrow custom/caller-owned span must
+  // not splice out a wider overlapping built-in detection, or the
+  // uncovered remainder of the wider span leaks.
+  let mut custom = entity(DetectionSource::Regex, 0.99, 2, 6, "date");
+  custom.source_detail = Some(SourceDetail::CustomRegex);
+  let result = merge_and_dedup(&[
+    entity(DetectionSource::Regex, 0.5, 0, 10, "date"),
+    custom,
+  ]);
+
+  assert_eq!(result.len(), 1);
+  let kept = result.first().expect("result");
+  assert_eq!(kept.source_detail, None);
+  assert_eq!(kept.start, 0);
+  assert_eq!(kept.end, 10);
+}
+
+#[test]
+fn equal_custom_span_keeps_custom_ownership_over_built_in_tie() {
+  // A custom regex/deny-list span with exactly the built-in's offsets
+  // keeps winning the conflict, as it did before ownership became
+  // width-aware: the user-configured entity (and its label) must not be
+  // silently swapped for the built-in's on an exact overlap. Both orders
+  // must agree. (Caller-supplied spans deliberately lose exact ties to
+  // the deterministic built-in instead; see
+  // deterministic_detections_win_equal_span_conflicts_with_callers in
+  // tests/prepared.rs.)
+  let mut custom = entity(DetectionSource::Regex, 0.5, 0, 10, "person");
+  custom.source_detail = Some(SourceDetail::CustomRegex);
+  let result = merge_and_dedup(&[
+    entity(DetectionSource::Trigger, 0.99, 0, 10, "person"),
+    custom.clone(),
+  ]);
+  assert_eq!(result.len(), 1);
+  assert_eq!(
+    result.first().expect("result").source_detail,
+    Some(SourceDetail::CustomRegex)
+  );
+
+  let reversed = merge_and_dedup(&[
+    custom,
+    entity(DetectionSource::Trigger, 0.99, 0, 10, "person"),
+  ]);
+  assert_eq!(reversed.len(), 1);
+  assert_eq!(
+    reversed.first().expect("result").source_detail,
+    Some(SourceDetail::CustomRegex)
+  );
+}
+
+#[test]
+fn wide_caller_span_beats_narrow_overlapping_built_in_span() {
+  let caller = entity(DetectionSource::Caller, 0.6, 0, 20, "person");
+  let result = merge_and_dedup(&[
+    entity(DetectionSource::Ner, 0.9, 5, 9, "person"),
+    caller,
+  ]);
+
+  assert_eq!(result.len(), 1);
+  let kept = result.first().expect("result");
+  assert_eq!(kept.source, DetectionSource::Caller);
+  assert_eq!(kept.start, 0);
+  assert_eq!(kept.end, 20);
+}
+
+#[test]
+fn address_containing_country_always_wins_over_nested_country() {
+  let result = merge_and_dedup(&[
+    entity(DetectionSource::Country, 0.95, 5, 12, "country"),
+    entity(DetectionSource::Trigger, 0.4, 0, 20, "address"),
+  ]);
+
+  assert_eq!(result.len(), 1);
+  let kept = result.first().expect("result");
+  assert_eq!(kept.label, "address");
+  assert_eq!(kept.start, 0);
+  assert_eq!(kept.end, 20);
 }
 
 #[test]

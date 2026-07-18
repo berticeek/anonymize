@@ -301,6 +301,7 @@ impl TriggerRegexCache {
   }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn process_trigger_matches(
   matches: &[SearchMatch],
   slice: PatternSlice,
@@ -368,10 +369,14 @@ pub(crate) fn process_trigger_matches(
     }
     if rule.label == "phone number"
       && char_count(&value.text) > MAX_TRIGGER_VALUE_LEN
-      && char_at(full_text, &offsets, value.end)? != Some('\n')
-      && char_at(full_text, &offsets, value.end)? != Some('\t')
     {
-      value = cap_phone_value(&value);
+      let delimiter_offset =
+        skip_trimmed_whitespace(full_text, &offsets, value.end)?;
+      if char_at(full_text, &offsets, delimiter_offset)? != Some('\n')
+        && char_at(full_text, &offsets, delimiter_offset)? != Some('\t')
+      {
+        value = cap_phone_value(&value);
+      }
     }
 
     let entity_start = if rule.include_trigger {
@@ -464,15 +469,39 @@ fn extract_value(
     PreparedTriggerStrategy::ToNextComma {
       stop_words,
       max_length,
-    } => extract_to_next_comma(
-      stripped,
-      value_start_byte,
-      label,
-      stop_words,
-      max_length.unwrap_or(MAX_TRIGGER_VALUE_LEN),
-      data.post_nominals,
-      data.sentence_terminal_currency_terms,
-    ),
+    } => {
+      // An uncapped scan that consumes the whole lookahead window while
+      // more text exists beyond it never found its structural delimiter:
+      // the "value" would be an arbitrary window-sized prefix and the tail
+      // would stay unredacted while looking covered. Fail closed instead
+      // of emitting the truncated span. When the window already reaches
+      // the end of the text, running off it is a legitimate end-of-input
+      // value and is kept.
+      //
+      // The scanner receives the full text tail and treats the window
+      // purely as a consumption limit, so every delimiter form — single
+      // characters, multi-character stop words (anchored at or straddling
+      // the edge), sentence terminators — keeps its normal lookahead even
+      // at the window boundary; see `extract_to_next_comma`.
+      let tail = text.get(value_start_byte..).unwrap_or(stripped);
+      let scan_limit = lookahead_end.saturating_sub(value_start_byte);
+      extract_to_next_comma(&ToNextCommaScanArgs {
+        value_text: tail,
+        scan_limit,
+        value_start_byte,
+        label,
+        stop_words,
+        length_cap: *max_length,
+        post_nominals: data.post_nominals,
+        sentence_terminal_currency_terms: data.sentence_terminal_currency_terms,
+      })
+      .and_then(|scan| {
+        if scan.hit_window_end && max_length.is_none() {
+          return None;
+        }
+        Some(scan.value)
+      })
+    }
     PreparedTriggerStrategy::ToEndOfLine => extract_to_end_of_line(
       remaining,
       stripped,
@@ -505,55 +534,182 @@ fn extract_value(
   Ok(extracted.and_then(|value| byte_value_to_offsets(text, offsets, value)))
 }
 
-fn extract_to_next_comma(
-  value_text: &str,
+/// A `to-next-comma` scan result: the extracted value plus whether the
+/// scan was truncated by the lookahead window — it reached the window
+/// limit with more text beyond and no structural delimiter (comma,
+/// newline, bracket, sentence terminator, stop word) anchored exactly at
+/// the limit. The caller fails closed on truncation for uncapped rules.
+struct ToNextCommaScan {
+  value: ByteValue,
+  hit_window_end: bool,
+}
+
+/// Inputs for [`extract_to_next_comma`].
+struct ToNextCommaScanArgs<'a> {
+  /// The full text tail from the value start — deliberately *not* clipped
+  /// to the lookahead window, so every delimiter check keeps its normal
+  /// lookahead (and one byte of look-behind for stop-word boundaries) even
+  /// at the window edge.
+  value_text: &'a str,
+  /// Maximum bytes of `value_text` the value may consume (the lookahead
+  /// window). Delimiter checks may read past it; the value itself may only
+  /// exceed it by an in-flight skip (decimal comma, post-nominal), which
+  /// then still counts as window truncation when more text follows.
+  scan_limit: usize,
   value_start_byte: usize,
-  label: &str,
-  stop_words: &[String],
-  length_cap: usize,
-  post_nominals: &[String],
-  sentence_terminal_currency_terms: &[String],
-) -> Option<ByteValue> {
-  let mut end = 0;
-  while end < value_text.len() {
+  label: &'a str,
+  stop_words: &'a [String],
+  length_cap: Option<usize>,
+  post_nominals: &'a [String],
+  sentence_terminal_currency_terms: &'a [String],
+}
+
+/// One scan decision at a byte position: end the value before this
+/// position, or advance by a number of bytes. `None` means the position is
+/// past the end of the text.
+enum ScanStep {
+  Stop,
+  Advance(usize),
+}
+
+/// Advances past whitespace that `byte_value` would trim from the end of
+/// the emitted value anyway. Never crosses `\n`, `\r`, or `\t` — those are
+/// structural stops in their own right and must stay visible to
+/// `scan_step`.
+/// The walk is bounded by `LINE_TRIGGER_LOOKAHEAD` additional bytes so the
+/// padding probe cannot turn the fixed per-trigger lookahead into a
+/// full-tail scan on a crafted document with enormous same-line space
+/// runs. A padding run longer than a whole extra lookahead window never
+/// occurs in a real value-plus-delimiter shape; when the bound is
+/// exhausted the caller's `scan_step` lands on whitespace, reads it as
+/// value content, and the scan fails closed as clipped — preserving the
+/// clipping invariant for every realistic input.
+fn skip_trimmable_padding(value_text: &str, start: usize) -> usize {
+  let limit = start.saturating_add(LINE_TRIGGER_LOOKAHEAD);
+  let mut end = start;
+  while end < limit {
     let Some((ch, len)) = char_at_byte(value_text, end) else {
       break;
     };
-    if matches!(ch, '\n' | '(' | ')' | '[' | ']' | '\t' | ';') {
-      break;
-    }
-    if ch == '.'
-      && is_sentence_terminator(
-        value_text,
-        end,
-        sentence_terminal_currency_terms,
-      )
-    {
-      break;
-    }
-    if hits_stop_word(value_text, end, stop_words) {
-      break;
-    }
-    if ch == ',' {
-      let after = value_text.get(end..).unwrap_or_default();
-      if is_decimal_comma(after) {
-        end = end.saturating_add(len);
-        continue;
-      }
-      if label == "person"
-        && let Some(skip) = post_nominal_len(after, post_nominals)
-      {
-        end = end.saturating_add(skip);
-        continue;
-      }
+    if !ch.is_whitespace() || matches!(ch, '\n' | '\r' | '\t') {
       break;
     }
     end = end.saturating_add(len);
   }
-  if prefix_char_count(value_text, end) > length_cap {
-    end = cap_at_word_boundary(value_text, length_cap);
+  end
+}
+
+fn scan_step(
+  value_text: &str,
+  end: usize,
+  label: &str,
+  stop_words: &[String],
+  post_nominals: &[String],
+  sentence_terminal_currency_terms: &[String],
+) -> Option<ScanStep> {
+  let (ch, len) = char_at_byte(value_text, end)?;
+  // '\r' stops alongside '\n': mid-text a CR is either followed by an LF
+  // (which stopped anyway, with the CR trimmed as trailing whitespace) or
+  // is itself a legacy line break; treating it as a stop keeps a CRLF at
+  // the window edge from looking like ordinary clipped content.
+  if matches!(ch, '\n' | '\r' | '(' | ')' | '[' | ']' | '\t' | ';') {
+    return Some(ScanStep::Stop);
   }
-  byte_value(value_text, value_start_byte, end)
+  if ch == '.'
+    && is_sentence_terminator(value_text, end, sentence_terminal_currency_terms)
+  {
+    return Some(ScanStep::Stop);
+  }
+  if hits_stop_word(value_text, end, stop_words) {
+    return Some(ScanStep::Stop);
+  }
+  if ch == ',' {
+    let after = value_text.get(end..).unwrap_or_default();
+    if is_decimal_comma(after) {
+      return Some(ScanStep::Advance(len));
+    }
+    if label == "person"
+      && let Some(skip) = post_nominal_len(after, post_nominals)
+    {
+      return Some(ScanStep::Advance(skip));
+    }
+    return Some(ScanStep::Stop);
+  }
+  Some(ScanStep::Advance(len))
+}
+
+fn extract_to_next_comma(
+  args: &ToNextCommaScanArgs<'_>,
+) -> Option<ToNextCommaScan> {
+  let ToNextCommaScanArgs {
+    value_text,
+    scan_limit,
+    value_start_byte,
+    label,
+    stop_words,
+    length_cap,
+    post_nominals,
+    sentence_terminal_currency_terms,
+  } = *args;
+  let limit = scan_limit.min(value_text.len());
+  let mut end = 0;
+  let mut stopped = false;
+  while end < limit {
+    match scan_step(
+      value_text,
+      end,
+      label,
+      stop_words,
+      post_nominals,
+      sentence_terminal_currency_terms,
+    ) {
+      None => break,
+      Some(ScanStep::Stop) => {
+        stopped = true;
+        break;
+      }
+      Some(ScanStep::Advance(step)) => {
+        end = end.saturating_add(step.max(1));
+      }
+    }
+  }
+  // The clipping invariant: the scan is clipped only if terminating it
+  // would require consuming additional *value* content — non-trimmable,
+  // non-delimiter characters — beyond the limit. Trailing trim-able
+  // padding (whitespace `byte_value` strips from the emitted value
+  // regardless) is walked through first, exactly as it would be consumed
+  // mid-window, and the same `scan_step` used inside the loop then decides
+  // at the first non-padding position: a delimiter, stop word, or end of
+  // text there terminates the value identically to mid-window behavior,
+  // while real value content past the limit fails closed. Nothing walked
+  // here can reach the emitted value, because it is all trailing
+  // whitespace.
+  let hit_window_end = if stopped {
+    false
+  } else {
+    end = skip_trimmable_padding(value_text, end);
+    end < value_text.len()
+      && !matches!(
+        scan_step(
+          value_text,
+          end,
+          label,
+          stop_words,
+          post_nominals,
+          sentence_terminal_currency_terms,
+        ),
+        Some(ScanStep::Stop)
+      )
+  };
+  if let Some(cap) = length_cap
+    && prefix_char_count(value_text, end) > cap
+  {
+    end = cap_at_word_boundary(value_text, cap);
+  }
+  byte_value(value_text, value_start_byte, end).map(|value| ToNextCommaScan {
+    value,
+    hit_window_end,
+  })
 }
 
 fn extract_to_end_of_line(
@@ -889,10 +1045,17 @@ fn build_fancy_regex(pattern: &str, flags: Option<&str>) -> Result<FancyRegex> {
 
 fn get_trigger_lookahead(strategy: &PreparedTriggerStrategy) -> usize {
   match strategy {
-    PreparedTriggerStrategy::ToNextComma { max_length, .. } => max_length
-      .unwrap_or(MAX_TRIGGER_VALUE_LEN)
-      .saturating_add(TRIGGER_LOOKAHEAD_MARGIN),
-    PreparedTriggerStrategy::ToEndOfLine => LINE_TRIGGER_LOOKAHEAD,
+    // No configured cap: scan a full line so the structural stop
+    // conditions (comma, hard-stop char, newline) can find the real end
+    // of a long value instead of being cut short by the lookahead.
+    PreparedTriggerStrategy::ToNextComma {
+      max_length: None, ..
+    }
+    | PreparedTriggerStrategy::ToEndOfLine => LINE_TRIGGER_LOOKAHEAD,
+    PreparedTriggerStrategy::ToNextComma {
+      max_length: Some(max),
+      ..
+    } => max.saturating_add(TRIGGER_LOOKAHEAD_MARGIN),
     PreparedTriggerStrategy::NWords { count } => count
       .saturating_mul(64)
       .saturating_add(TRIGGER_LOOKAHEAD_MARGIN),
@@ -949,6 +1112,27 @@ fn char_at(
 ) -> Result<Option<char>> {
   let byte = offsets.validate_offset(offset)?;
   Ok(text.get(byte..).and_then(|suffix| suffix.chars().next()))
+}
+
+/// Advances past whitespace that extraction already trimmed off the value
+/// (e.g. trailing spaces before a line/tab delimiter), so delimiter checks
+/// against `value.end` see the real next structural character instead of
+/// the trimmed padding. Never skips `\n`/`\t` themselves, since those are
+/// the delimiters callers check for.
+fn skip_trimmed_whitespace(
+  text: &str,
+  offsets: &ByteOffsets<'_>,
+  offset: u32,
+) -> Result<u32> {
+  let byte = offsets.validate_offset(offset)?;
+  let Some(suffix) = text.get(byte..) else {
+    return Ok(offset);
+  };
+  let trimmed = suffix.trim_start_matches(|ch: char| {
+    ch.is_whitespace() && !matches!(ch, '\n' | '\t')
+  });
+  let skipped = suffix.len().saturating_sub(trimmed.len());
+  Ok(offset.saturating_add(u32::try_from(skipped).unwrap_or(u32::MAX)))
 }
 
 fn char_at_byte(text: &str, byte: usize) -> Option<(char, usize)> {
@@ -1231,7 +1415,10 @@ fn phone_shape_end(
     if ch == '.'
       && text
         .get(index.saturating_add(ch.len_utf8())..)
-        .is_some_and(|tail| tail.starts_with(char::is_whitespace))
+        .is_some_and(|tail| {
+          tail.starts_with(char::is_whitespace)
+            && !dot_space_precedes_phone_digits(tail)
+        })
     {
       break;
     }
@@ -1259,6 +1446,32 @@ fn phone_shape_end(
     end = end.saturating_add(extension_len);
   }
   (end > 0).then_some(end)
+}
+
+/// Reports whether a lookahead past a `.` + whitespace finds a phone digit
+/// group, i.e. the dot is a separator inside a number (`"+1. 555"`) rather
+/// than a sentence-ending period. A following digit run only counts as a
+/// phone group when it is not itself a list ordinal: digits immediately
+/// followed by `.` and then a non-digit (`"… 5678. 1. Definitions"`) are a
+/// numbered-sentence marker, so the original dot ends the value.
+fn dot_space_precedes_phone_digits(after_dot: &str) -> bool {
+  let rest = after_dot.trim_start();
+  let digit_len = rest
+    .char_indices()
+    .find(|(_, ch)| !ch.is_ascii_digit())
+    .map_or(rest.len(), |(index, _)| index);
+  if digit_len == 0 {
+    return false;
+  }
+  let Some(after_marker_dot) = rest
+    .get(digit_len..)
+    .and_then(|tail| tail.strip_prefix('.'))
+  else {
+    return true;
+  };
+  !after_marker_dot
+    .trim_start()
+    .starts_with(|ch: char| !ch.is_ascii_digit())
 }
 
 fn phone_extension_suffix_len(
@@ -1333,17 +1546,22 @@ fn is_plausible_phone_trigger_value(value: &str) -> bool {
     >= MIN_TRIGGER_PHONE_DIGITS
 }
 
+/// Recognizes `YYYY-MM-DD` and `YYYY/MM/DD` shaped date padding (the
+/// separator must be the same character in both positions) so date-shaped
+/// text following a phone trigger isn't mistaken for a phone number.
 fn looks_like_iso_date(text: &str) -> bool {
   let bytes = text.as_bytes();
+  let Some(separator @ (b'-' | b'/')) = bytes.get(4).copied() else {
+    return false;
+  };
   bytes.len() >= 10
     && bytes
       .get(0..4)
       .is_some_and(|part| part.iter().all(u8::is_ascii_digit))
-    && bytes.get(4) == Some(&b'-')
+    && bytes.get(7).copied() == Some(separator)
     && bytes
       .get(5..7)
       .is_some_and(|part| part.iter().all(u8::is_ascii_digit))
-    && bytes.get(7) == Some(&b'-')
     && bytes
       .get(8..10)
       .is_some_and(|part| part.iter().all(u8::is_ascii_digit))
@@ -1610,9 +1828,14 @@ fn is_name_particle(token: &str) -> bool {
       | "y"
       | "zu"
       | "af"
+      | "av"
       | "ben"
       | "bin"
       | "al"
+      | "ten"
+      | "ter"
+      | "zum"
+      | "zur"
       | "d'"
       | "d’"
   )
@@ -1755,9 +1978,9 @@ mod tests {
     let prefix = "zapsaná v obchodním rejstříku vedeném Krajským soudem v Ústí nad Labem, oddíl B";
     let trigger_start = prefix.find("Krajským soudem").unwrap();
     let trigger_end = trigger_start.saturating_add("Krajským soudem".len());
-    let lookahead_end = trigger_end
-      .saturating_add(MAX_TRIGGER_VALUE_LEN)
-      .saturating_add(TRIGGER_LOOKAHEAD_MARGIN);
+    // An unset `max_length` scans a full line (LINE_TRIGGER_LOOKAHEAD),
+    // not the historical MAX_TRIGGER_VALUE_LEN + margin window.
+    let lookahead_end = trigger_end.saturating_add(LINE_TRIGGER_LOOKAHEAD);
     let padding_len =
       lookahead_end.saturating_sub(prefix.len()).saturating_sub(1);
     let text = format!("{prefix}{}é trailing", "x".repeat(padding_len));
@@ -1798,5 +2021,483 @@ mod tests {
 
     assert_eq!(entities.len(), 1);
     assert_eq!(entities[0].text, "Krajským soudem v Ústí nad Labem");
+  }
+
+  #[test]
+  fn person_trigger_keeps_full_name_with_missing_particle() {
+    let text = "Name: Maarten ten Brink, born 1980";
+    let start = text.find("Name").unwrap();
+    let end = start.saturating_add("Name".len());
+    let data = PreparedTriggerData::new(TriggerData {
+      rules: vec![TriggerRule {
+        trigger: String::from("Name"),
+        label: String::from("person"),
+        strategy: TriggerStrategy::ToNextComma {
+          stop_words: Vec::new(),
+          max_length: None,
+        },
+        validations: vec![TriggerValidation::StartsUppercase],
+        include_trigger: false,
+      }],
+      address_stop_keywords: Vec::new(),
+      party_position_terms: Vec::new(),
+      legal_form_suffixes: Vec::new(),
+      post_nominals: Vec::new(),
+      sentence_terminal_currency_terms: Vec::new(),
+      phone_extension_labels: Vec::new(),
+      number_markers: Vec::new(),
+      number_labels: Vec::new(),
+    })
+    .unwrap();
+
+    let entities = process_trigger_matches(
+      &[SearchMatch::Literal {
+        pattern: 0,
+        start: u32::try_from(start).unwrap(),
+        end: u32::try_from(end).unwrap(),
+      }],
+      PatternSlice { start: 0, end: 1 },
+      text,
+      &data,
+      None,
+    )
+    .unwrap();
+
+    // "ten" is a missing name particle (see is_name_particle); without it
+    // person_name_run_end() would trim the span to just "Maarten",
+    // leaking "ten Brink".
+    assert_eq!(entities.len(), 1);
+    assert_eq!(entities[0].text, "Maarten ten Brink");
+  }
+
+  #[test]
+  fn to_next_comma_without_max_length_captures_full_value() {
+    let long_value = "A".repeat(150);
+    let text = format!("Address: {long_value}, next line");
+    let start = text.find("Address").unwrap();
+    let end = start.saturating_add("Address".len());
+    let data = PreparedTriggerData::new(TriggerData {
+      rules: vec![TriggerRule {
+        trigger: String::from("Address"),
+        label: String::from("organization"),
+        strategy: TriggerStrategy::ToNextComma {
+          stop_words: Vec::new(),
+          max_length: None,
+        },
+        validations: vec![TriggerValidation::MinLength(3)],
+        include_trigger: false,
+      }],
+      address_stop_keywords: Vec::new(),
+      party_position_terms: Vec::new(),
+      legal_form_suffixes: Vec::new(),
+      post_nominals: Vec::new(),
+      sentence_terminal_currency_terms: Vec::new(),
+      phone_extension_labels: Vec::new(),
+      number_markers: Vec::new(),
+      number_labels: Vec::new(),
+    })
+    .unwrap();
+
+    let entities = process_trigger_matches(
+      &[SearchMatch::Literal {
+        pattern: 0,
+        start: u32::try_from(start).unwrap(),
+        end: u32::try_from(end).unwrap(),
+      }],
+      PatternSlice { start: 0, end: 1 },
+      &text,
+      &data,
+      None,
+    )
+    .unwrap();
+
+    // No configured `maxLength` must mean genuinely uncapped: the value is
+    // over MAX_TRIGGER_VALUE_LEN (100) chars but ends cleanly at the
+    // comma, so it must not be truncated to ~100 chars.
+    assert_eq!(entities.len(), 1);
+    assert_eq!(entities[0].text, long_value);
+  }
+
+  fn uncapped_to_next_comma_data() -> PreparedTriggerData {
+    uncapped_to_next_comma_data_with_stops(Vec::new())
+  }
+
+  fn uncapped_to_next_comma_data_with_stops(
+    stop_words: Vec<String>,
+  ) -> PreparedTriggerData {
+    PreparedTriggerData::new(TriggerData {
+      rules: vec![TriggerRule {
+        trigger: String::from("Address"),
+        label: String::from("organization"),
+        strategy: TriggerStrategy::ToNextComma {
+          stop_words,
+          max_length: None,
+        },
+        validations: vec![TriggerValidation::MinLength(3)],
+        include_trigger: false,
+      }],
+      address_stop_keywords: Vec::new(),
+      party_position_terms: Vec::new(),
+      legal_form_suffixes: Vec::new(),
+      post_nominals: Vec::new(),
+      sentence_terminal_currency_terms: Vec::new(),
+      phone_extension_labels: Vec::new(),
+      number_markers: Vec::new(),
+      number_labels: Vec::new(),
+    })
+    .unwrap()
+  }
+
+  fn run_single_trigger(text: &str, data: &PreparedTriggerData) -> Vec<String> {
+    let start = text.find("Address").unwrap();
+    let end = start.saturating_add("Address".len());
+    process_trigger_matches(
+      &[SearchMatch::Literal {
+        pattern: 0,
+        start: u32::try_from(start).unwrap(),
+        end: u32::try_from(end).unwrap(),
+      }],
+      PatternSlice { start: 0, end: 1 },
+      text,
+      data,
+      None,
+    )
+    .unwrap()
+    .into_iter()
+    .map(|entity| entity.text)
+    .collect()
+  }
+
+  #[test]
+  fn uncapped_to_next_comma_fails_closed_on_clipped_lookahead_window() {
+    // The delimiter sits beyond the LINE_TRIGGER_LOOKAHEAD window and more
+    // text exists past the window, so the scan never reaches a structural
+    // stop. Emitting the window-sized prefix would present a truncated
+    // span as a complete value while the tail stays unredacted; the
+    // extraction must fail closed instead.
+    let data = uncapped_to_next_comma_data();
+    let overflow = "A".repeat(LINE_TRIGGER_LOOKAHEAD.saturating_add(64));
+    let text = format!("Address: {overflow}, next line");
+
+    let texts = run_single_trigger(&text, &data);
+
+    assert_eq!(
+      texts,
+      Vec::<String>::new(),
+      "a window-truncated uncapped value must not be emitted"
+    );
+  }
+
+  #[test]
+  fn uncapped_to_next_comma_keeps_value_ending_at_end_of_text() {
+    // Running off the window is legitimate when the window already covers
+    // the rest of the text: the value simply ends at end of input.
+    let data = uncapped_to_next_comma_data();
+
+    let texts = run_single_trigger("Address: Acme Corporation", &data);
+
+    assert_eq!(texts, vec![String::from("Acme Corporation")]);
+  }
+
+  #[test]
+  fn uncapped_to_next_comma_keeps_value_with_delimiter_at_window_edge() {
+    // The lookahead window spans LINE_TRIGGER_LOOKAHEAD UTF-16 units from
+    // the trigger end; ": " consumes two of them, so this value fills the
+    // window exactly and its comma is the very next character. The
+    // delimiter sits at the window edge, the value is complete, and it
+    // must be emitted rather than rejected as window-clipped.
+    let data = uncapped_to_next_comma_data();
+    let exact = "A".repeat(LINE_TRIGGER_LOOKAHEAD.saturating_sub(2));
+    let text = format!("Address: {exact}, next line");
+
+    let texts = run_single_trigger(&text, &data);
+
+    assert_eq!(
+      texts,
+      vec![exact],
+      "a complete value whose delimiter sits exactly at the window edge must be kept"
+    );
+  }
+
+  #[test]
+  fn uncapped_to_next_comma_keeps_value_with_padding_before_edge_comma() {
+    // Trim-able padding between the window edge and the comma does not
+    // make the value clipped: mid-window the spaces would be consumed and
+    // then trimmed by byte_value, and the edge must behave identically.
+    let data = uncapped_to_next_comma_data();
+    let value = "A".repeat(LINE_TRIGGER_LOOKAHEAD.saturating_sub(2));
+    let text = format!("Address: {value}   , next line");
+
+    let texts = run_single_trigger(&text, &data);
+
+    assert_eq!(
+      texts,
+      vec![value],
+      "padding before an edge comma must complete the value"
+    );
+  }
+
+  #[test]
+  fn uncapped_to_next_comma_keeps_value_with_padding_before_edge_stop_word() {
+    // The same holds when the delimiter past the padding is a configured
+    // stop word rather than a delimiter character.
+    let data =
+      uncapped_to_next_comma_data_with_stops(vec![String::from("oddíl")]);
+    let value = "A".repeat(LINE_TRIGGER_LOOKAHEAD.saturating_sub(2));
+    let text = format!("Address: {value}   oddíl B");
+
+    let texts = run_single_trigger(&text, &data);
+
+    assert_eq!(
+      texts,
+      vec![value],
+      "padding before an edge stop word must complete the value"
+    );
+  }
+
+  #[test]
+  fn uncapped_to_next_comma_rejects_padding_followed_by_value_content() {
+    // Padding past the edge followed by more value content is a genuine
+    // truncation: terminating the scan would require consuming that
+    // content, so the extraction still fails closed.
+    let data = uncapped_to_next_comma_data();
+    let value = "A".repeat(LINE_TRIGGER_LOOKAHEAD.saturating_sub(2));
+    let text = format!("Address: {value}   more, next line");
+
+    let texts = run_single_trigger(&text, &data);
+
+    assert_eq!(
+      texts,
+      Vec::<String>::new(),
+      "padding followed by value content past the edge must fail closed"
+    );
+  }
+
+  #[test]
+  fn uncapped_to_next_comma_keeps_value_with_padding_up_to_the_bound() {
+    // A padding run of exactly LINE_TRIGGER_LOOKAHEAD bytes stays within
+    // the bounded probe: the walk ends precisely on the comma and the
+    // value is complete.
+    let data = uncapped_to_next_comma_data();
+    let value = "A".repeat(LINE_TRIGGER_LOOKAHEAD.saturating_sub(2));
+    let padding = " ".repeat(LINE_TRIGGER_LOOKAHEAD);
+    let text = format!("Address: {value}{padding}, next line");
+
+    let texts = run_single_trigger(&text, &data);
+
+    assert_eq!(
+      texts,
+      vec![value],
+      "padding up to the probe bound must still complete the value"
+    );
+  }
+
+  #[test]
+  fn uncapped_to_next_comma_rejects_padding_beyond_the_bound() {
+    // A padding run longer than the probe bound is not walked to its end:
+    // the probe stops inside the run, the position reads as unconsumed
+    // content, and the scan fails closed without scanning the tail.
+    let data = uncapped_to_next_comma_data();
+    let value = "A".repeat(LINE_TRIGGER_LOOKAHEAD.saturating_sub(2));
+    let padding = " ".repeat(LINE_TRIGGER_LOOKAHEAD.saturating_add(1));
+    let text = format!("Address: {value}{padding}, next line");
+
+    let texts = run_single_trigger(&text, &data);
+
+    assert_eq!(
+      texts,
+      Vec::<String>::new(),
+      "padding beyond the probe bound must fail closed"
+    );
+  }
+
+  #[test]
+  fn uncapped_to_next_comma_keeps_value_with_padding_to_end_of_text() {
+    // Padding that runs to the end of the text terminates the value like
+    // any end-of-input value; nothing of value sits past the window.
+    let data = uncapped_to_next_comma_data();
+    let value = "A".repeat(LINE_TRIGGER_LOOKAHEAD.saturating_sub(2));
+    let text = format!("Address: {value}   ");
+
+    let texts = run_single_trigger(&text, &data);
+
+    assert_eq!(
+      texts,
+      vec![value],
+      "padding to the end of text must complete the value"
+    );
+  }
+
+  #[test]
+  fn uncapped_to_next_comma_keeps_value_with_stop_word_at_window_edge() {
+    // A multi-character stop word ("oddíl") anchored exactly at the window
+    // edge must end the value the same way it would mid-window: the value
+    // is complete, not clipped. The scanner sees the full text tail, so
+    // the stop word (and its trailing word boundary) stays visible.
+    let data =
+      uncapped_to_next_comma_data_with_stops(vec![String::from("oddíl")]);
+    // ": " consumes two window units and the separating space one more, so
+    // the stop word starts exactly at LINE_TRIGGER_LOOKAHEAD units past
+    // the trigger end.
+    let value = "A".repeat(LINE_TRIGGER_LOOKAHEAD.saturating_sub(3));
+    let text = format!("Address: {value} oddíl B");
+
+    let texts = run_single_trigger(&text, &data);
+
+    assert_eq!(
+      texts,
+      vec![value],
+      "a stop word anchored at the window edge must complete the value"
+    );
+  }
+
+  #[test]
+  fn uncapped_to_next_comma_keeps_value_with_stop_word_straddling_edge() {
+    // A stop word that begins inside the window but extends past the edge
+    // must also be recognized: a window-clipped slice would hide its tail
+    // ("od|díl"), miss the match, and wrongly report the scan as clipped.
+    let data =
+      uncapped_to_next_comma_data_with_stops(vec![String::from("oddíl")]);
+    // The stop word starts two characters before the window edge.
+    let value = "A".repeat(LINE_TRIGGER_LOOKAHEAD.saturating_sub(5));
+    let text = format!("Address: {value} oddíl B, next line");
+
+    let texts = run_single_trigger(&text, &data);
+
+    assert_eq!(
+      texts,
+      vec![value],
+      "a stop word straddling the window edge must complete the value"
+    );
+  }
+
+  #[test]
+  fn uncapped_to_next_comma_keeps_value_with_crlf_at_window_edge() {
+    // A CRLF line break at the window edge is a delimiter, not clipped
+    // content: '\r' stops the scan exactly like '\n'.
+    let data = uncapped_to_next_comma_data();
+    let value = "A".repeat(LINE_TRIGGER_LOOKAHEAD.saturating_sub(2));
+    let text = format!("Address: {value}\r\nnext line");
+
+    let texts = run_single_trigger(&text, &data);
+
+    assert_eq!(
+      texts,
+      vec![value],
+      "a CRLF at the window edge must complete the value"
+    );
+  }
+
+  #[test]
+  fn uncapped_to_next_comma_rejects_multi_unit_char_crossing_the_edge() {
+    // A surrogate-pair character whose two UTF-16 units would straddle the
+    // window limit pushes the limit to the char boundary before it; the
+    // value genuinely continues past the window, so the scan must fail
+    // closed — without panicking on a mid-character slice.
+    let data = uncapped_to_next_comma_data();
+    let value = "A".repeat(LINE_TRIGGER_LOOKAHEAD.saturating_sub(3));
+    let text = format!("Address: {value}\u{1F600}BBBB, next line");
+
+    let texts = run_single_trigger(&text, &data);
+
+    assert_eq!(
+      texts,
+      Vec::<String>::new(),
+      "a value continuing through the edge with a multi-unit char must fail closed"
+    );
+  }
+
+  #[test]
+  fn phone_trigger_accepts_dot_space_separators() {
+    let text = "Phone: +1. 555. 123. 4567\n";
+    let start = text.find("Phone").unwrap();
+    let end = start.saturating_add("Phone".len());
+    let data = PreparedTriggerData::new(TriggerData {
+      rules: vec![TriggerRule {
+        trigger: String::from("Phone"),
+        label: String::from("phone number"),
+        strategy: TriggerStrategy::ToEndOfLine,
+        validations: Vec::new(),
+        include_trigger: false,
+      }],
+      address_stop_keywords: Vec::new(),
+      party_position_terms: Vec::new(),
+      legal_form_suffixes: Vec::new(),
+      post_nominals: Vec::new(),
+      sentence_terminal_currency_terms: Vec::new(),
+      phone_extension_labels: Vec::new(),
+      number_markers: Vec::new(),
+      number_labels: Vec::new(),
+    })
+    .unwrap();
+
+    let entities = process_trigger_matches(
+      &[SearchMatch::Literal {
+        pattern: 0,
+        start: u32::try_from(start).unwrap(),
+        end: u32::try_from(end).unwrap(),
+      }],
+      PatternSlice { start: 0, end: 1 },
+      text,
+      &data,
+      None,
+    )
+    .unwrap();
+
+    // phone_shape_end() must not hard-stop on ". " when digits follow
+    // shortly after; otherwise the value is dropped by the 5-digit
+    // plausibility check.
+    assert_eq!(entities.len(), 1);
+    assert_eq!(entities[0].label, "phone number");
+    assert_eq!(entities[0].text, "+1. 555. 123. 4567");
+  }
+
+  #[test]
+  fn phone_trigger_cap_ignores_trailing_spaces_before_newline() {
+    let digits = "1".repeat(105);
+    let text = format!("Phone: {digits}   \n");
+    let start = text.find("Phone").unwrap();
+    let end = start.saturating_add("Phone".len());
+    let data = PreparedTriggerData::new(TriggerData {
+      rules: vec![TriggerRule {
+        trigger: String::from("Phone"),
+        label: String::from("phone number"),
+        strategy: TriggerStrategy::ToNextComma {
+          stop_words: Vec::new(),
+          max_length: None,
+        },
+        validations: Vec::new(),
+        include_trigger: false,
+      }],
+      address_stop_keywords: Vec::new(),
+      party_position_terms: Vec::new(),
+      legal_form_suffixes: Vec::new(),
+      post_nominals: Vec::new(),
+      sentence_terminal_currency_terms: Vec::new(),
+      phone_extension_labels: Vec::new(),
+      number_markers: Vec::new(),
+      number_labels: Vec::new(),
+    })
+    .unwrap();
+
+    let entities = process_trigger_matches(
+      &[SearchMatch::Literal {
+        pattern: 0,
+        start: u32::try_from(start).unwrap(),
+        end: u32::try_from(end).unwrap(),
+      }],
+      PatternSlice { start: 0, end: 1 },
+      &text,
+      &data,
+      None,
+    )
+    .unwrap();
+
+    // The scan (and byte_value()'s trailing-whitespace trim) leaves
+    // value.end pointing before the 3 trailing spaces, not at the `\n`.
+    // The cap decision must look past that trimmed whitespace instead of
+    // treating the value as un-delimited and truncating it.
+    assert_eq!(entities.len(), 1);
+    assert_eq!(entities[0].text, digits);
   }
 }

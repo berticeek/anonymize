@@ -221,6 +221,18 @@ pub(super) fn build_deny_list_filter_data(
     document_heading_ordinal_markers: shape("documentHeadingOrdinalMarkers"),
     defined_term_cues: deny_list_filter_static("definedTermCues")?,
     signing_place_guards,
+    // Both title sources: dotted honorifics ("M.", "Sig.", "Sr.") live in
+    // `title_abbreviations` (already trailing-dot-stripped and lowercased),
+    // not in `titles_list`, and the defined-term-quote first-name exception
+    // (`starts_with_known_first_name`, processors.rs) must recognize them
+    // too or a quote like `"M. Jean Dupont" shall mean ...` stays
+    // suppressed. Downstream `lower_set` dedups the union.
+    title_tokens: corpus
+      .titles_list
+      .iter()
+      .chain(corpus.title_abbreviations.iter())
+      .cloned()
+      .collect(),
   })
 }
 
@@ -566,6 +578,7 @@ struct DenyBuildContext<'a> {
   corpus: &'a NameCorpus,
   common_words: &'a HashSet<String>,
   month_names: &'a HashSet<String>,
+  common_word_exemptions: &'a HashSet<String>,
 }
 
 /// Excluded deny-list categories as a lookup set.
@@ -584,6 +597,7 @@ pub(super) fn build_deny_list(
   ctx: &DenyBuildContextArgs<'_>,
 ) -> Result<Option<DenyListData>, AssembleError> {
   let month_names = load_month_names()?;
+  let common_word_exemptions = load_common_word_exemptions()?;
   let dctx = DenyBuildContext {
     config: ctx.config,
     dictionaries: ctx.dictionaries,
@@ -592,6 +606,7 @@ pub(super) fn build_deny_list(
     corpus: ctx.corpus,
     common_words: &ctx.corpus.common_words_set,
     month_names: &month_names,
+    common_word_exemptions: &common_word_exemptions,
   };
 
   let dictionaries = dctx.dictionaries;
@@ -690,8 +705,22 @@ fn apply_dictionary_entries(
     {
       continue;
     }
+    // Names-category dictionaries (the bundled per-language first-name and
+    // surname lists, plus the mixed-gender `names/global` fallback) are all
+    // genuine person-name sources, not generic curated terms. Tag them
+    // `name-dictionary` rather than the generic `deny-list` source so
+    // `has_person_name_source` (processors.rs) recognizes them the same way
+    // it recognizes the scoped `first-name`/`surname` name-corpus expansion;
+    // otherwise a chain built entirely from these entries (e.g. an
+    // unscoped-config match on a global-list-only name) is silently dropped
+    // in `append_person_name_hits`.
+    let source = if category == "Names" {
+      "name-dictionary"
+    } else {
+      "deny-list"
+    };
     for entry in entries {
-      add_deny_list_entry(builder, dctx, entry, &meta.label, "deny-list");
+      add_deny_list_entry(builder, dctx, entry, &meta.label, source);
     }
   }
 }
@@ -736,7 +765,10 @@ fn add_deny_list_entry(
   let lower = js_lowercase(&normalized);
   if source != "custom-deny-list" {
     if label != "address" {
-      if is_single_word(&normalized) && dctx.common_words.contains(&lower) {
+      if is_single_word(&normalized)
+        && dctx.common_words.contains(&lower)
+        && !dctx.common_word_exemptions.contains(&lower)
+      {
         return;
       }
       if is_short_curated_noise_acronym(&normalized) {
@@ -823,6 +855,30 @@ fn load_month_names() -> Result<HashSet<String>, AssembleError> {
   }
   let data: DateMonths = parse_data_file("date-months.json")?;
   Ok(data.en.iter().map(|m| js_lowercase(m)).collect())
+}
+
+/// Loads `deny-list-common-word-exemptions.json` as a lowercased lookup set.
+///
+/// These are curated deny-list entries (e.g. bank/org aliases like
+/// "Citizens") that collide with `common-words-en.json` and would otherwise
+/// be dropped by `add_deny_list_entry`'s single-common-word veto. This is
+/// deliberately a separate file from `allow-list.json`: the allow list is
+/// consulted at match time and unconditionally rejects matches on its
+/// keywords (`curated_labels_for_match`), so routing the assemble-time
+/// exemption through it would register the pattern but suppress every match,
+/// making the recovery a no-op. A dedicated exemption set keeps the two
+/// mechanisms disjoint; the `common_word_exemptions_stay_off_the_allow_list`
+/// test enforces that invariant.
+fn load_common_word_exemptions() -> Result<HashSet<String>, AssembleError> {
+  let exemptions: WordsFile =
+    parse_data_file("deny-list-common-word-exemptions.json")?;
+  Ok(
+    exemptions
+      .words
+      .iter()
+      .map(|word| js_lowercase(word))
+      .collect(),
+  )
 }
 
 // ── native encoding (toNativeDenyListData) ──────────────────────────────────
@@ -938,4 +994,243 @@ pub(super) fn deny_originals_and_sources(
     })
     .collect();
   (data.originals.clone(), sources)
+}
+
+#[cfg(test)]
+mod tests {
+  #![allow(clippy::expect_used)]
+
+  use stella_anonymize_core::assemble::DictionaryMeta;
+
+  use super::*;
+
+  fn test_pipeline_config() -> PipelineConfig {
+    PipelineConfig {
+      threshold: 0.5,
+      enable_trigger_phrases: false,
+      enable_regex: false,
+      languages: None,
+      language: None,
+      enable_legal_forms: None,
+      enable_name_corpus: false,
+      name_corpus_languages: None,
+      enable_deny_list: true,
+      deny_list_countries: None,
+      deny_list_regions: None,
+      deny_list_exclude_categories: None,
+      custom_deny_list: None,
+      custom_regexes: None,
+      enable_gazetteer: false,
+      enable_countries: None,
+      enable_ner: false,
+      enable_confidence_boost: false,
+      enable_coreference: false,
+      enable_zone_classification: None,
+      enable_hotword_rules: None,
+      labels: Vec::new(),
+      workspace_id: String::from("test-workspace"),
+      dictionaries: None,
+    }
+  }
+
+  fn test_corpus() -> NameCorpus {
+    NameCorpus {
+      first_names_list: Vec::new(),
+      surnames_list: Vec::new(),
+      titles_list: Vec::new(),
+      title_abbreviations: Vec::new(),
+      excluded_list: Vec::new(),
+      common_words: Vec::new(),
+      non_western_names_list: Vec::new(),
+      excluded_all_caps_list: Vec::new(),
+      common_words_set: HashSet::new(),
+    }
+  }
+
+  /// `add_deny_list_entry`'s common-word veto (single-word, non-address,
+  /// non-custom entries whose lowercase form is in `common-words-en.json`)
+  /// used to drop known org/bank aliases like "Citizens" outright. This
+  /// exercises the assemble-time exemption directly: an entry present in
+  /// `common_word_exemptions` must survive even though it is also a common
+  /// word.
+  #[test]
+  fn exempted_org_alias_survives_common_word_filter() {
+    let config = test_pipeline_config();
+    let corpus = test_corpus();
+    let common_words = HashSet::from([String::from("citizens")]);
+    let month_names = HashSet::new();
+    let common_word_exemptions = HashSet::from([String::from("citizens")]);
+    let dctx = DenyBuildContext {
+      config: &config,
+      dictionaries: None,
+      use_scoped_name_corpus: false,
+      deny_list_countries: None,
+      corpus: &corpus,
+      common_words: &common_words,
+      month_names: &month_names,
+      common_word_exemptions: &common_word_exemptions,
+    };
+    let mut builder = Builder::new();
+
+    add_deny_list_entry(
+      &mut builder,
+      &dctx,
+      "Citizens",
+      "organization",
+      "deny-list",
+    );
+
+    assert!(
+      builder.pattern_index.contains_key("citizens"),
+      "an exempted org alias should survive the common-word filter"
+    );
+  }
+
+  /// A common word that is *not* exempted must still be dropped: the
+  /// exemption above is deliberately narrow.
+  #[test]
+  fn plain_common_word_without_exemption_is_still_dropped() {
+    let config = test_pipeline_config();
+    let corpus = test_corpus();
+    let common_words = HashSet::from([String::from("agreement")]);
+    let month_names = HashSet::new();
+    let common_word_exemptions = HashSet::new();
+    let dctx = DenyBuildContext {
+      config: &config,
+      dictionaries: None,
+      use_scoped_name_corpus: false,
+      deny_list_countries: None,
+      corpus: &corpus,
+      common_words: &common_words,
+      month_names: &month_names,
+      common_word_exemptions: &common_word_exemptions,
+    };
+    let mut builder = Builder::new();
+
+    add_deny_list_entry(
+      &mut builder,
+      &dctx,
+      "Agreement",
+      "organization",
+      "deny-list",
+    );
+
+    assert!(
+      !builder.pattern_index.contains_key("agreement"),
+      "a non-allow-listed common word should still be dropped"
+    );
+  }
+
+  /// Names-category dictionary entries (the injected per-language
+  /// first-name/surname lists plus the mixed `names/global` fallback) must
+  /// be tagged with a person-name source, not the generic `deny-list`
+  /// source, so match-time `has_person_name_source` recognizes them the
+  /// same way it recognizes the scoped name-corpus expansion. Without this,
+  /// a global-only name (present only via the injected dictionary, not the
+  /// scoped `first-name`/`surname` corpus expansion) is silently discarded
+  /// downstream in `append_person_name_hits`.
+  #[test]
+  fn names_category_dictionary_entries_get_name_dictionary_source() {
+    let config = PipelineConfig {
+      enable_name_corpus: true,
+      ..test_pipeline_config()
+    };
+    let corpus = test_corpus();
+    let common_words = HashSet::new();
+    let month_names = HashSet::new();
+    let common_word_exemptions = HashSet::new();
+    let dictionaries = Dictionaries {
+      deny_list: Some(OrderedMap(vec![(
+        String::from("names/global"),
+        vec![String::from("Aabidah")],
+      )])),
+      deny_list_meta: Some(OrderedMap(vec![(
+        String::from("names/global"),
+        DictionaryMeta {
+          label: String::from("person"),
+          category: DenyListCategory::Names,
+          country: None,
+        },
+      )])),
+      ..Dictionaries::default()
+    };
+    let dctx = DenyBuildContext {
+      config: &config,
+      dictionaries: Some(&dictionaries),
+      use_scoped_name_corpus: false,
+      deny_list_countries: None,
+      corpus: &corpus,
+      common_words: &common_words,
+      month_names: &month_names,
+      common_word_exemptions: &common_word_exemptions,
+    };
+    let mut builder = Builder::new();
+
+    apply_dictionary_entries(&mut builder, &dctx, None, &HashSet::new());
+
+    let index = builder
+      .pattern_index
+      .get("aabidah")
+      .copied()
+      .expect("global-only name should be registered");
+    assert_eq!(
+      builder.source_list.get(index),
+      Some(&vec![String::from("name-dictionary")])
+    );
+  }
+
+  /// The defined-term-quote filter must carry both title sources: plain
+  /// title tokens ("dr") and the trailing-dot-stripped abbreviations
+  /// ("m" from "M."). Only `titles_list` used to be wired through, so a
+  /// quote like `"M. Jean Dupont" shall mean ...` never got the leading
+  /// title stripped and stayed suppressed.
+  #[test]
+  fn quote_filter_title_tokens_include_title_abbreviations() {
+    let corpus = NameCorpus {
+      titles_list: vec![String::from("dr")],
+      title_abbreviations: vec![String::from("m")],
+      ..test_corpus()
+    };
+
+    let filters = build_deny_list_filter_data(&corpus)
+      .expect("deny-list filter data should assemble");
+
+    assert!(
+      filters.title_tokens.contains(&String::from("dr")),
+      "plain title tokens should be retained"
+    );
+    assert!(
+      filters.title_tokens.contains(&String::from("m")),
+      "title abbreviations should be unioned into the quote filter"
+    );
+  }
+
+  /// The assemble-time exemption is only effective while the exempted word
+  /// stays *off* the match-time allow list: `curated_labels_for_match`
+  /// (processors.rs) unconditionally rejects any keyword present in
+  /// `allow-list.json`, so a word in both files would be registered at
+  /// assemble time and then suppressed on every match, silently undoing the
+  /// recovery.
+  #[test]
+  fn common_word_exemptions_stay_off_the_allow_list() {
+    let exemptions = load_common_word_exemptions()
+      .expect("embedded exemption file should parse");
+    assert!(
+      !exemptions.is_empty(),
+      "the exemption file should carry at least one entry"
+    );
+    let allow_list: WordsFile = parse_data_file("allow-list.json")
+      .expect("embedded allow-list file should parse");
+    let allow_list: HashSet<String> = allow_list
+      .words
+      .iter()
+      .map(|word| js_lowercase(word))
+      .collect();
+    let overlap: Vec<&String> = exemptions.intersection(&allow_list).collect();
+    assert!(
+      overlap.is_empty(),
+      "deny-list common-word exemptions must not appear in allow-list.json \
+       (match-time filtering would suppress every match): {overlap:?}"
+    );
+  }
 }

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { strToU8, unzipSync, zipSync } from "fflate";
 
 import {
+  DOCX_ENTRY_MAX_BYTES,
   DocxRewriteError,
   extractDocxText,
   rewriteDocxText,
@@ -147,6 +148,68 @@ describe("rewriteDocxText", () => {
         rewriteForFirstBlock(archive, [{ start: 1, end: 2, replacement: "x" }]),
       ]),
     ).toThrow("UTF-16 boundaries");
+  });
+
+  test("budgets replacement text by its escaped size, not its raw size", () => {
+    // rewritePartXml expands "&" to "&amp;" (5 bytes) before materializing
+    // the patched XML, so the budgets must count post-escape bytes: a
+    // replacement whose raw size fits comfortably under the entry budget can
+    // still materialize far past it once escaped.
+    const archive = docx("<w:p><w:r><w:t>Alice</w:t></w:r></w:p>");
+    const ampersands = "&".repeat(Math.ceil(DOCX_ENTRY_MAX_BYTES / 5) + 1);
+    expect(() =>
+      rewriteDocxText(archive, [
+        rewriteForFirstBlock(archive, [
+          { start: 0, end: 5, replacement: ampersands },
+        ]),
+      ]),
+    ).toThrow(
+      `DOCX rewrite replacement text for a single part must not exceed ${DOCX_ENTRY_MAX_BYTES} aggregate escaped UTF-8 bytes`,
+    );
+  });
+
+  test("budgets the projected full part, including untouched scaffolding", () => {
+    // The escaped-node budgets alone miss a part's unchanged markup: a
+    // near-limit part plus a modest rewrite of one small node must be
+    // rejected before the patched XML is materialized, not after.
+    const half = Math.ceil(DOCX_ENTRY_MAX_BYTES / 2) + 1024;
+    const scaffolding = "X".repeat(half);
+    const archive = docx(
+      `<w:p><w:r><w:t>${scaffolding}</w:t></w:r></w:p><w:p><w:r><w:t>Alice</w:t></w:r></w:p>`,
+    );
+    const block = extractDocxText(archive).blocks.at(1);
+    if (block === undefined) {
+      throw new Error("test fixture must contain a second block");
+    }
+    expect(() =>
+      rewriteDocxText(archive, [
+        {
+          location: block.location,
+          expectedText: block.text,
+          replacements: [{ start: 0, end: 5, replacement: "Y".repeat(half) }],
+        },
+      ]),
+    ).toThrow(
+      `Rewritten DOCX parts must not exceed ${DOCX_ENTRY_MAX_BYTES} projected bytes`,
+    );
+  });
+
+  test("budgets the escaped size of whole updated nodes, not just replacements", () => {
+    // A CDATA "&" run costs one byte per character on disk but five once
+    // escaped, and rewritePartXml re-escapes the entire updated node value
+    // on rebuild. A one-byte replacement into such a node must therefore
+    // trip the budget even though the replacement itself is tiny.
+    const ampersands = "&".repeat(Math.ceil(DOCX_ENTRY_MAX_BYTES / 5) + 1);
+    const archive = docx(
+      `<w:p><w:r><w:t><![CDATA[${ampersands}]]></w:t></w:r></w:p>`,
+    );
+    expect(() =>
+      rewriteDocxText(archive, [
+        rewriteForFirstBlock(archive, [{ start: 0, end: 1, replacement: "x" }]),
+      ]),
+    ).toThrow(
+      `DOCX rewritten text nodes for a single part must not exceed ${DOCX_ENTRY_MAX_BYTES} escaped UTF-8 bytes`,
+    );
   });
 
   test("returns an exact archive copy for an empty rewrite plan", () => {

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::common::{entity_len, is_caller_owned};
 use super::sanitize::sanitize_entities;
-use super::{DetectionSource, PipelineEntity};
+use super::{DetectionSource, PipelineEntity, SourceDetail};
 
 #[must_use]
 pub fn merge_and_dedup(entities: &[PipelineEntity]) -> Vec<PipelineEntity> {
@@ -88,6 +88,7 @@ fn overlapping_indexes(
     .collect()
 }
 
+#[allow(clippy::too_many_lines)]
 fn should_replace(
   candidate: &PipelineEntity,
   existing: &PipelineEntity,
@@ -97,7 +98,48 @@ fn should_replace(
   let candidate_caller_owned = is_caller_owned(candidate);
   let existing_caller_owned = is_caller_owned(existing);
   if candidate_caller_owned != existing_caller_owned {
-    return candidate_caller_owned;
+    // Caller/custom-owned spans only outrank a built-in detection when
+    // they are at least as wide. A wide owned span still evicts a narrow
+    // built-in fragment (the owned span was being silently overridden by
+    // whatever smaller thing a built-in detector happened to catch), but a
+    // narrow owned fragment (e.g. a custom regex that only matches part of
+    // a date) must not splice out a wider built-in span it sits inside, or
+    // the uncovered remainder leaks.
+    //
+    // Exactly equal spans are not a leak case in either direction; the tie
+    // splits by ownership class. Custom-configured spans (custom regex /
+    // custom deny-list entries) keep their pre-existing tie win, so the
+    // user-configured entity and label survive an exact overlap instead of
+    // being silently swapped for the built-in's. Caller-supplied spans
+    // (DetectionSource::Caller) deliberately lose exact ties to the
+    // deterministic built-in detection instead — see
+    // `deterministic_detections_win_equal_span_conflicts_with_callers` —
+    // so resolution stays reproducible when a caller echoes a span the
+    // pipeline already finds on its own.
+    let owned = if candidate_caller_owned {
+      candidate
+    } else {
+      existing
+    };
+    let owned_len = entity_len(owned);
+    let other_len = if candidate_caller_owned {
+      existing_len
+    } else {
+      candidate_len
+    };
+    if owned_len > other_len {
+      return candidate_caller_owned;
+    }
+    if owned_len < other_len {
+      return !candidate_caller_owned;
+    }
+    let owned_is_custom = matches!(
+      owned.source_detail,
+      Some(SourceDetail::CustomDenyList | SourceDetail::CustomRegex)
+    );
+    if owned_is_custom {
+      return candidate_caller_owned;
+    }
   }
 
   if literal_contains(candidate, existing) && candidate_len > existing_len {
@@ -142,14 +184,10 @@ fn should_replace(
     return candidate_len > existing_len;
   }
 
-  if regex_shape_contains_trigger_fragment(candidate, existing)
-    && candidate_len > existing_len
-  {
+  if regex_shape_contains_trigger_fragment(candidate, existing) {
     return true;
   }
-  if regex_shape_contains_trigger_fragment(existing, candidate)
-    && existing_len > candidate_len
-  {
+  if regex_shape_contains_trigger_fragment(existing, candidate) {
     return false;
   }
 
@@ -173,6 +211,17 @@ fn should_replace(
     && candidate_len > existing_len
   {
     return true;
+  }
+
+  // An address containing a nested country always wins on containment: an
+  // address missing a seed type can score below the country's fixed 0.95,
+  // and without this guard the narrower country span would splice out (and
+  // thereby truncate) the wider address it sits inside.
+  if address_contains_country(candidate, existing) {
+    return true;
+  }
+  if address_contains_country(existing, candidate) {
+    return false;
   }
 
   let candidate_priority = candidate.source.priority();
@@ -366,9 +415,57 @@ fn regex_shape_contains_trigger_fragment(
   outer.label == inner.label
     && outer.source == DetectionSource::Regex
     && inner.source == DetectionSource::Trigger
-    && outer.start <= inner.start
-    && outer.end >= comparable_trigger_fragment_end(inner)
     && regex_shape_preferred_label(&outer.label)
+    && regex_shape_covers_trigger_value(outer, inner)
+}
+
+/// Whether `outer` (a structured regex match) covers everything of value
+/// that `inner` (a trigger match) captured, even when `inner` only
+/// partially overlaps `outer` instead of fully containing it.
+///
+/// A trigger's padding can sweep in leading context and push its start
+/// earlier than the regex match's start, while the trigger's own capture
+/// cap truncates its end short of the real value (e.g. a phone number).
+/// Requiring `outer` to always start at or before `inner` misses that
+/// case: the regex starts later, inside the trigger's padded span, but
+/// extends further right than the truncated trigger does. Without
+/// recognizing that as coverage, the higher-priority truncated trigger
+/// wins and the untruncated suffix leaks. So a partial, non-containing
+/// overlap still counts as covered when `outer` reaches past `inner`'s
+/// raw end — but only when the trigger prefix the regex leaves uncovered
+/// is label padding, not value content (see
+/// [`trigger_prefix_is_label_padding`]).
+fn regex_shape_covers_trigger_value(
+  outer: &PipelineEntity,
+  inner: &PipelineEntity,
+) -> bool {
+  let trimmed_inner_end = comparable_trigger_fragment_end(inner);
+  if outer.start <= inner.start {
+    return outer.end >= trimmed_inner_end;
+  }
+  outer.end > inner.end
+    && outer.end >= trimmed_inner_end
+    && trigger_prefix_is_label_padding(inner, outer.start)
+}
+
+/// Whether the slice of `inner`'s captured text that a later-starting
+/// regex match leaves uncovered (`inner.start..outer_start`) is label
+/// padding ("Telefon: ") rather than value content. The regex-shape labels
+/// are all numeric shapes, so any numeric character in that prefix means
+/// the prefix carries part of the value itself (e.g. a country-code head
+/// the regex shape did not match); dropping the trigger would then leave
+/// those digits unredacted. A prefix that cannot be sliced on a char
+/// boundary is treated as value content, keeping the trigger.
+fn trigger_prefix_is_label_padding(
+  inner: &PipelineEntity,
+  outer_start: u32,
+) -> bool {
+  let prefix_len = usize::try_from(outer_start.saturating_sub(inner.start))
+    .unwrap_or(usize::MAX);
+  inner
+    .text
+    .get(..prefix_len)
+    .is_some_and(|prefix| !prefix.chars().any(char::is_numeric))
 }
 
 fn comparable_trigger_fragment_end(entity: &PipelineEntity) -> u32 {
@@ -437,6 +534,16 @@ fn country_inside_person_or_org(
     && matches!(container.label.as_str(), "person" | "organization")
     && container.start <= country.start
     && container.end >= country.end
+}
+
+fn address_contains_country(
+  address: &PipelineEntity,
+  country: &PipelineEntity,
+) -> bool {
+  address.label == "address"
+    && country.label == "country"
+    && address.start <= country.start
+    && address.end >= country.end
 }
 
 fn longest_wins_label(label: &str) -> bool {
