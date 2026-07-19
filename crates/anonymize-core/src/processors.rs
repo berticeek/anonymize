@@ -1036,15 +1036,37 @@ fn curated_labels_for_match(
     return Ok(Vec::new());
   }
 
+  // Hyphen compounds (Dodd-Frank, Brno-Nový) are real tokens for places and
+  // orgs; preserve person names only when both components have name evidence.
+  let has_hyphen_edge = has_hyphen_compound_edge(
+    args.full_text,
+    args.offsets,
+    args.start,
+    args.start.saturating_add(byte_len(args.match_text)),
+  )?;
+  let supported_hyphenated_person = has_hyphen_edge
+    && has_supported_hyphenated_person_edge(
+      args.full_text,
+      args.offsets,
+      args.start,
+      args.start.saturating_add(byte_len(args.match_text)),
+      args.keyword,
+      args.filters,
+    )?;
+
   Ok(
     args
       .labels
       .iter()
       .filter(|label| {
-        !args
+        let is_custom_duplicate = args
           .custom_pattern_labels
           .iter()
-          .any(|custom| custom == label)
+          .any(|custom| custom == label);
+        let is_hyphenated_person = has_hyphen_edge
+          && !supported_hyphenated_person
+          && *label == PERSON_LABEL;
+        !is_custom_duplicate && !is_hyphenated_person
       })
       .map(String::from)
       .collect(),
@@ -2111,6 +2133,8 @@ fn extend_city_districts(
   offsets: &ByteOffsets<'_>,
   filters: Option<&DenyListFilterData>,
 ) -> Result<()> {
+  const PERSONAL_NAME_PREFIX_WINDOW: u32 = 64;
+
   for entity in entities {
     if entity.label != ADDRESS_LABEL
       || entity.source_detail == Some(SourceDetail::CustomDenyList)
@@ -2118,9 +2142,25 @@ fn extend_city_districts(
       continue;
     }
 
-    if let Some(suffix) =
-      match_district_suffix(slice_from(full_text, offsets, entity.end)?)
+    let after = slice_from(full_text, offsets, entity.end)?;
+    let mut district_suffix = match_district_suffix(after, false);
+    if district_suffix.is_none()
+      && let Some(roman_suffix) = match_district_suffix(after, true)
     {
+      // City lists overlap surnames (e.g. US city "Ferguson"). Do not treat
+      // generational Roman numerals after a personal-name prefix as districts.
+      let prefix_start = offsets.floor_offset(
+        entity.start.saturating_sub(PERSONAL_NAME_PREFIX_WINDOW),
+      )?;
+      let name_prefix_before = offsets.slice(prefix_start, entity.start)?;
+      let allow_roman_district = filters.is_none_or(|filters| {
+        !has_personal_name_prefix(&name_prefix_before, filters)
+      });
+      if allow_roman_district {
+        district_suffix = Some(roman_suffix);
+      }
+    }
+    if let Some(suffix) = district_suffix {
       entity.end = entity.end.saturating_add(byte_len(suffix));
       entity.text = offsets.slice(entity.start, entity.end)?;
     }
@@ -2132,11 +2172,11 @@ fn extend_city_districts(
       entity.text = offsets.slice(entity.start, entity.end)?;
     }
 
-    let before = offsets.slice(
+    let postal_before = offsets.slice(
       offsets.floor_offset(entity.start.saturating_sub(10))?,
       entity.start,
     )?;
-    if let Some(prefix) = postal_prefix(&before) {
+    if let Some(prefix) = postal_prefix(&postal_before) {
       entity.start = entity.start.saturating_sub(byte_len(prefix));
       entity.text = offsets.slice(entity.start, entity.end)?;
     }
@@ -2155,9 +2195,15 @@ fn extend_city_districts(
   Ok(())
 }
 
-fn match_district_suffix(after: &str) -> Option<&str> {
+fn match_district_suffix(after: &str, allow_roman: bool) -> Option<&str> {
   let rest = after.strip_prefix(' ')?;
-  let suffix = numeric_district(rest).or_else(|| roman_district(rest))?;
+  let suffix = numeric_district(rest).or_else(|| {
+    if allow_roman {
+      roman_district(rest)
+    } else {
+      None
+    }
+  })?;
   let end = ' '.len_utf8().saturating_add(suffix.len());
   let next = after.get(end..).and_then(|tail| tail.chars().next());
   next
@@ -2181,6 +2227,49 @@ fn roman_district(text: &str) -> Option<&str> {
   roman_districts()
     .iter()
     .find_map(|roman| text.starts_with(roman).then_some(*roman))
+}
+
+/// True when `before` ends with a given name and optional middle initials,
+/// so a following city-list hit is likely a surname rather than a bare city.
+fn has_personal_name_prefix(
+  before: &str,
+  filters: &DenyListFilterData,
+) -> bool {
+  let mut rest = before.trim_end_matches(|ch: char| ch.is_whitespace());
+  while let Some(dot_index) = rest
+    .char_indices()
+    .next_back()
+    .and_then(|(i, ch)| (ch == '.').then_some(i))
+  {
+    if dot_index.saturating_add('.'.len_utf8()) != rest.len() {
+      break;
+    }
+    let before_dot = rest.get(..dot_index).unwrap_or_default();
+    let Some((initial_index, initial)) = before_dot.char_indices().next_back()
+    else {
+      break;
+    };
+    if !initial.is_uppercase()
+      || before_dot
+        .get(initial_index..)
+        .is_none_or(|tail| tail.chars().count() != 1)
+    {
+      break;
+    }
+    let prefix = before_dot
+      .get(..initial_index)
+      .unwrap_or_default()
+      .trim_end();
+    if prefix.is_empty() {
+      break;
+    }
+    rest = prefix;
+  }
+
+  let Some(last_word) = rest.split_whitespace().next_back() else {
+    return false;
+  };
+  filters.first_names.contains(&last_word.to_lowercase())
 }
 
 const fn roman_districts() -> &'static [&'static str] {
@@ -2292,7 +2381,7 @@ fn byte_index_for_char(text: &str, char_index: usize) -> usize {
 }
 
 const fn is_dash(ch: char) -> bool {
-  matches!(ch, '-' | '–' | '—')
+  matches!(ch, '-' | '‑' | '–' | '—')
 }
 
 fn match_trailing_address_word<'a>(
@@ -2435,6 +2524,87 @@ fn custom_match_has_valid_edges(
   }
 
   Ok(true)
+}
+
+fn has_hyphen_compound_edge(
+  full_text: &str,
+  offsets: &ByteOffsets<'_>,
+  start: u32,
+  end: u32,
+) -> Result<bool> {
+  let start_byte = offsets.validate_offset(start)?;
+  let end_byte = offsets.validate_offset(end)?;
+  let previous = full_text
+    .get(..start_byte)
+    .and_then(|prefix| prefix.chars().next_back());
+  if previous.is_some_and(is_dash) {
+    return Ok(true);
+  }
+  let next = full_text
+    .get(end_byte..)
+    .and_then(|suffix| suffix.chars().next());
+  Ok(next.is_some_and(is_dash))
+}
+
+fn has_supported_hyphenated_person_edge(
+  full_text: &str,
+  offsets: &ByteOffsets<'_>,
+  start: u32,
+  end: u32,
+  keyword: &str,
+  filters: &DenyListFilterData,
+) -> Result<bool> {
+  if !filters.first_names.contains(keyword) {
+    return Ok(false);
+  }
+
+  let start_byte = offsets.validate_offset(start)?;
+  let end_byte = offsets.validate_offset(end)?;
+  let previous_dash = full_text
+    .get(..start_byte)
+    .and_then(|prefix| prefix.chars().next_back())
+    .filter(|ch| is_dash(*ch));
+  if let Some(dash) = previous_dash {
+    let partner = start_byte
+      .checked_sub(dash.len_utf8())
+      .and_then(|hyphen_byte| full_text.get(..hyphen_byte))
+      .map(|prefix| {
+        prefix
+          .chars()
+          .rev()
+          .take_while(|ch| ch.is_alphabetic())
+          .collect::<String>()
+          .chars()
+          .rev()
+          .collect::<String>()
+          .to_lowercase()
+      });
+    if partner.is_some_and(|word| filters.first_names.contains(&word)) {
+      return Ok(true);
+    }
+  }
+
+  let next_dash = full_text
+    .get(end_byte..)
+    .and_then(|suffix| suffix.chars().next())
+    .filter(|ch| is_dash(*ch));
+  if let Some(dash) = next_dash {
+    let partner = end_byte
+      .checked_add(dash.len_utf8())
+      .and_then(|partner_byte| full_text.get(partner_byte..))
+      .map(|suffix| {
+        suffix
+          .chars()
+          .take_while(|ch| ch.is_alphabetic())
+          .collect::<String>()
+          .to_lowercase()
+      });
+    if partner.is_some_and(|word| filters.first_names.contains(&word)) {
+      return Ok(true);
+    }
+  }
+
+  Ok(false)
 }
 
 const fn fuzzy_distance(found: &SearchMatch) -> Option<u32> {
@@ -2750,5 +2920,210 @@ mod tests {
     assert_eq!(entities.len(), 1);
     assert_eq!(entities[0].label, "person");
     assert_eq!(entities[0].text, "Jean Dupont");
+  }
+
+  #[test]
+  fn deny_list_rejects_name_fragment_after_hyphen() {
+    let data = DenyListMatchData {
+      labels: vec![vec![String::from("person")]].into(),
+      custom_labels: vec![vec![]].into(),
+      originals: vec![String::from("Frank")],
+      pattern_meta: DenyListPatternMetaSet::default(),
+      sources: vec![vec![String::from("first-name")]].into(),
+      filters: Some(DenyListFilterData::default()),
+    };
+
+    for dash in ['-', '‑', '–'] {
+      let text = format!("under the Dodd{dash}Frank Wall Street Reform Act.");
+      let start = u32::try_from(text.find("Frank").unwrap()).unwrap();
+      let matches = vec![SearchMatch::Literal {
+        pattern: 0,
+        start,
+        end: start.saturating_add(5),
+      }];
+      let entities = process_deny_list_matches(
+        &matches,
+        PatternSlice { start: 0, end: 1 },
+        &text,
+        &data,
+      )
+      .unwrap();
+
+      assert!(entities.is_empty(), "dash {dash:?}");
+    }
+  }
+
+  #[test]
+  fn deny_list_keeps_supported_hyphenated_person_name() {
+    let text = "Signed by Jean-Paul Smith.";
+    let names = ["Jean", "Paul", "Smith"];
+    let matches = names
+      .iter()
+      .enumerate()
+      .map(|(pattern, name)| {
+        let start = u32::try_from(text.find(name).unwrap()).unwrap();
+        SearchMatch::Literal {
+          pattern: u32::try_from(pattern).unwrap(),
+          start,
+          end: start.saturating_add(byte_len(name)),
+        }
+      })
+      .collect::<Vec<_>>();
+    let mut first_names = BTreeSet::new();
+    first_names.insert(String::from("jean"));
+    first_names.insert(String::from("paul"));
+    let data = DenyListMatchData {
+      labels: vec![
+        vec![String::from("person")],
+        vec![String::from("person")],
+        vec![String::from("person")],
+      ]
+      .into(),
+      custom_labels: vec![vec![], vec![], vec![]].into(),
+      originals: names.map(String::from).to_vec(),
+      pattern_meta: DenyListPatternMetaSet::default(),
+      sources: vec![
+        vec![String::from("first-name")],
+        vec![String::from("first-name")],
+        vec![String::from("surname")],
+      ]
+      .into(),
+      filters: Some(DenyListFilterData {
+        first_names,
+        ..DenyListFilterData::default()
+      }),
+    };
+
+    let entities = process_deny_list_matches(
+      &matches,
+      PatternSlice { start: 0, end: 3 },
+      text,
+      &data,
+    )
+    .unwrap();
+
+    assert_eq!(entities.len(), 1);
+    assert_eq!(entities[0].label, "person");
+    assert_eq!(entities[0].text, "Jean-Paul Smith");
+  }
+
+  #[test]
+  fn deny_list_keeps_standalone_city_roman_district() {
+    let text = "office in Paris XV near the river";
+    let start = u32::try_from(text.find("Paris").unwrap()).unwrap();
+    let end = start.saturating_add(5);
+    let matches = vec![SearchMatch::Literal {
+      pattern: 0,
+      start,
+      end,
+    }];
+    let data = DenyListMatchData {
+      labels: vec![vec![String::from("address")]].into(),
+      custom_labels: vec![vec![]].into(),
+      originals: vec![String::from("Paris")],
+      pattern_meta: DenyListPatternMetaSet::default(),
+      sources: vec![vec![String::from("city")]].into(),
+      filters: Some(DenyListFilterData::default()),
+    };
+
+    let entities = process_deny_list_matches(
+      &matches,
+      PatternSlice { start: 0, end: 1 },
+      text,
+      &data,
+    )
+    .unwrap();
+
+    assert_eq!(entities.len(), 1);
+    assert_eq!(entities[0].text, "Paris XV");
+  }
+
+  #[test]
+  fn deny_list_keeps_city_roman_district_after_capitalized_non_name() {
+    let text = "Company's Paris XV office";
+    let start = u32::try_from(text.find("Paris").unwrap()).unwrap();
+    let end = start.saturating_add(5);
+    let matches = vec![SearchMatch::Literal {
+      pattern: 0,
+      start,
+      end,
+    }];
+    let mut first_names = BTreeSet::new();
+    first_names.insert(String::from("james"));
+    let data = DenyListMatchData {
+      labels: vec![vec![String::from("address")]].into(),
+      custom_labels: vec![vec![]].into(),
+      originals: vec![String::from("Paris")],
+      pattern_meta: DenyListPatternMetaSet::default(),
+      sources: vec![vec![String::from("city")]].into(),
+      filters: Some(DenyListFilterData {
+        first_names,
+        ..DenyListFilterData::default()
+      }),
+    };
+
+    let entities = process_deny_list_matches(
+      &matches,
+      PatternSlice { start: 0, end: 1 },
+      text,
+      &data,
+    )
+    .unwrap();
+
+    assert_eq!(entities.len(), 1);
+    assert_eq!(entities[0].text, "Paris XV");
+  }
+
+  #[test]
+  fn deny_list_does_not_attach_generational_roman_after_person_prefix() {
+    let text = "and James J. Ferguson III (hereinafter referred to as you)";
+    let start = u32::try_from(text.find("Ferguson").unwrap()).unwrap();
+    let end = start.saturating_add(8);
+    let matches = vec![SearchMatch::Literal {
+      pattern: 0,
+      start,
+      end,
+    }];
+    let mut first_names = BTreeSet::new();
+    first_names.insert(String::from("james"));
+    let data = DenyListMatchData {
+      labels: vec![vec![String::from("address")]].into(),
+      custom_labels: vec![vec![]].into(),
+      originals: vec![String::from("Ferguson")],
+      pattern_meta: DenyListPatternMetaSet::default(),
+      sources: vec![vec![String::from("city")]].into(),
+      filters: Some(DenyListFilterData {
+        first_names,
+        ..DenyListFilterData::default()
+      }),
+    };
+
+    let entities = process_deny_list_matches(
+      &matches,
+      PatternSlice { start: 0, end: 1 },
+      text,
+      &data,
+    )
+    .unwrap();
+
+    assert_eq!(entities.len(), 1);
+    assert_eq!(entities[0].text, "Ferguson");
+    assert!(!entities.iter().any(|entity| entity.text == "Ferguson III"));
+  }
+
+  #[test]
+  fn personal_name_prefix_requires_first_name_evidence() {
+    let mut first_names = BTreeSet::new();
+    first_names.insert(String::from("james"));
+    let filters = DenyListFilterData {
+      first_names,
+      ..DenyListFilterData::default()
+    };
+
+    assert!(has_personal_name_prefix("and James J. ", &filters));
+    assert!(has_personal_name_prefix("James\nJ. ", &filters));
+    assert!(!has_personal_name_prefix("Company's ", &filters));
+    assert!(!has_personal_name_prefix("office in ", &filters));
+    assert!(!has_personal_name_prefix("", &filters));
   }
 }
