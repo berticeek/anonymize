@@ -17,6 +17,7 @@ from urllib.parse import unquote
 from xml.etree import ElementTree as ET
 
 from ._native import extract_docx_text_json as _extract_docx_text_json
+from ._native import rewrite_docx_text_native as _rewrite_docx_text_native
 
 DOCX_EXTRACTION_CONTRACT_VERSION = 1
 DOCX_ARCHIVE_MAX_BYTES = 64 * 1024 * 1024
@@ -719,7 +720,7 @@ def _write_archive(entries: Mapping[str, bytes], order: Sequence[str]) -> bytes:
     return document
 
 
-def rewrite_docx_text(
+def _rewrite_docx_text_python_oracle(
     document: bytes | bytearray | memoryview,
     rewrites: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
@@ -914,6 +915,156 @@ def rewrite_docx_text(
         "document": _write_archive(entries, order),
         "rewrittenBlockCount": len(rewrites),
         "appliedReplacementCount": applied,
+    }
+
+
+def _preflight_rewrite_plan(
+    rewrites: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    if len(rewrites) > DOCX_MAX_TEXT_BLOCKS:
+        raise DocxRewriteError(
+            "rewrite-limit-exceeded",
+            f"DOCX rewrites must not contain more than {DOCX_MAX_TEXT_BLOCKS} blocks",
+        )
+    replacement_count = 0
+    estimated_bytes = len(rewrites) * 256
+    serializable_rewrites: list[dict[str, Any]] = []
+    for rewrite in rewrites:
+        replacements = rewrite.get("replacements")
+        if not isinstance(replacements, Sequence) or isinstance(
+            replacements, (str, bytes, bytearray)
+        ):
+            raise DocxRewriteError(
+                "invalid-replacement",
+                "DOCX block rewrite replacements must be a sequence",
+            )
+        replacement_count += len(replacements)
+        if replacement_count > DOCX_MAX_REPLACEMENTS:
+            raise DocxRewriteError(
+                "rewrite-limit-exceeded",
+                f"DOCX rewrites must not contain more than {DOCX_MAX_REPLACEMENTS} replacements",
+            )
+        expected_text = rewrite.get("expectedText")
+        estimated_bytes += (
+            len(expected_text) * 6 if isinstance(expected_text, str) else 0
+        ) + len(replacements) * 96
+        serializable_replacements: list[Any] = []
+        for replacement in replacements:
+            if isinstance(replacement, Mapping):
+                value = replacement.get("replacement")
+                if isinstance(value, str):
+                    estimated_bytes += len(value) * 6
+                serializable_replacements.append(
+                    {
+                        "start": replacement.get("start"),
+                        "end": replacement.get("end"),
+                        "replacement": value,
+                    }
+                )
+            else:
+                serializable_replacements.append(None)
+        location = rewrite.get("location")
+        serializable_location: Any = None
+        if isinstance(location, Mapping):
+            serializable_location = {
+                "type": location.get("type"),
+                "blockIndex": location.get("blockIndex"),
+            }
+            part = location.get("part")
+            if isinstance(part, Mapping):
+                serializable_location["part"] = {
+                    "type": part.get("type"),
+                    "path": part.get("path"),
+                }
+                for value in (part.get("type"), part.get("path")):
+                    if isinstance(value, str):
+                        estimated_bytes += len(value) * 6
+            location_type = location.get("type")
+            if isinstance(location_type, str):
+                estimated_bytes += len(location_type) * 6
+            for key in (
+                "xmlPath",
+                "tablePath",
+                "rowPath",
+                "cellPath",
+                "textBoxPath",
+            ):
+                path = location.get(key)
+                if isinstance(path, Sequence) and not isinstance(
+                    path, (str, bytes, bytearray)
+                ):
+                    if len(path) > DOCX_XML_MAX_DEPTH:
+                        raise DocxRewriteError(
+                            "invalid-replacement",
+                            f"DOCX rewrite location paths must not exceed {DOCX_XML_MAX_DEPTH} entries",
+                        )
+                    estimated_bytes += len(path) * 24
+                    serializable_location[key] = list(path)
+        serializable_rewrites.append(
+            {
+                "location": serializable_location,
+                "expectedText": expected_text,
+                "replacements": serializable_replacements,
+            }
+        )
+        if estimated_bytes > DOCX_UNCOMPRESSED_MAX_BYTES:
+            raise DocxRewriteError(
+                "rewrite-limit-exceeded",
+                f"DOCX rewrite plans must not exceed {DOCX_UNCOMPRESSED_MAX_BYTES} estimated serialized bytes",
+            )
+    return serializable_rewrites
+
+
+def rewrite_docx_text(
+    document: bytes | bytearray | memoryview,
+    rewrites: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Apply the shared Rust DOCX rewrite contract."""
+
+    try:
+        normalized_rewrites = []
+        for rewrite in rewrites:
+            normalized = dict(rewrite)
+            if "expectedText" not in normalized and "expected_text" in normalized:
+                normalized["expectedText"] = normalized.pop("expected_text")
+            normalized_rewrites.append(normalized)
+        serializable_rewrites = _preflight_rewrite_plan(normalized_rewrites)
+        rewrites_json = json.dumps(serializable_rewrites, separators=(",", ":"))
+    except DocxRewriteError:
+        raise
+    except (TypeError, ValueError) as error:
+        raise DocxRewriteError(
+            "invalid-replacement",
+            f"DOCX rewrite plan is not serializable: {error}",
+        ) from error
+    try:
+        rewritten, block_count, replacement_count = _rewrite_docx_text_native(
+            bytes(document), rewrites_json
+        )
+    except ValueError as error:
+        message = str(error)
+        code, separator, detail = message.partition(": ")
+        if separator and code in {
+            "archive-limit-exceeded",
+            "invalid-archive",
+            "invalid-package",
+            "invalid-xml",
+            "unsafe-entry-path",
+            "uncompressed-limit-exceeded",
+        }:
+            raise DocxExtractionError(code, detail) from error
+        if separator and code in {
+            "invalid-replacement",
+            "rewrite-limit-exceeded",
+            "stale-extraction",
+            "unsupported-replacement",
+        }:
+            raise DocxRewriteError(code, detail) from error
+        raise
+    return {
+        "document": bytes(rewritten),
+        "rewrittenBlockCount": block_count,
+        "appliedReplacementCount": replacement_count,
     }
 
 

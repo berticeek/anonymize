@@ -141,6 +141,11 @@ type PythonParityOutput = {
     external_relationship_is_unsupported: boolean;
     hyperlink_requires_partial_opt_in: boolean;
     revision_requires_partial_opt_in: boolean;
+    invalid_rewrite_error: string | null;
+    invalid_plan_error: string | null;
+    unserializable_plan_error: string | null;
+    oversized_plan_error: string | null;
+    ignored_extra_field: boolean;
   };
 };
 
@@ -332,6 +337,53 @@ docx_revision_requires_partial = rejects_full_coverage(
     make_docx('</w:t></w:r><w:ins><w:r><w:t>Alice</w:t></w:r></w:ins><w:r><w:t>'),
     "parity_docx_revision_1",
 )
+try:
+    anonymize.rewrite_docx_text(b"not a DOCX archive", [])
+except anonymize.DocxExtractionError as error:
+    docx_invalid_rewrite_error = error.code
+else:
+    docx_invalid_rewrite_error = None
+try:
+    anonymize.rewrite_docx_text(docx_source, [{
+        "location": docx_block["location"],
+        "expected_text": docx_block["text"],
+        "replacements": [{"start": -1, "end": 2, "replacement": "x"}],
+    }])
+except anonymize.DocxRewriteError as error:
+    docx_invalid_plan_error = error.code
+else:
+    docx_invalid_plan_error = None
+try:
+    anonymize.rewrite_docx_text(docx_source, [{
+        "location": docx_block["location"],
+        "expected_text": docx_block["text"],
+        "replacements": [{"start": 0, "end": 2, "replacement": b"x"}],
+    }])
+except anonymize.DocxRewriteError as error:
+    docx_unserializable_plan_error = error.code
+else:
+    docx_unserializable_plan_error = None
+try:
+    anonymize.rewrite_docx_text(docx_source, [{
+        "location": docx_block["location"],
+        "expected_text": docx_block["text"],
+        "replacements": range(1_000_001),
+    }])
+except anonymize.DocxRewriteError as error:
+    docx_oversized_plan_error = error.code
+else:
+    docx_oversized_plan_error = None
+docx_extra_plan = {
+    "location": docx_block["location"],
+    "expected_text": docx_block["text"],
+    "replacements": [{"start": 0, "end": 3, "replacement": "Ana"}],
+}
+docx_extra_plan["unexpected"] = docx_extra_plan
+docx_extra_result = anonymize.rewrite_docx_text(docx_source, [docx_extra_plan])
+docx_ignored_extra_field = (
+    anonymize.extract_docx_text(docx_extra_result["document"])["blocks"][0]["text"]
+    == "Ana Novak signed."
+)
 deanonymised_text = anonymize.deanonymise(
     session_first.redaction.redacted_text,
     session_first.redaction.redaction_map,
@@ -513,6 +565,11 @@ print(
                 ),
                 "hyperlink_requires_partial_opt_in": docx_hyperlink_requires_partial,
                 "revision_requires_partial_opt_in": docx_revision_requires_partial,
+                "invalid_rewrite_error": docx_invalid_rewrite_error,
+                "invalid_plan_error": docx_invalid_plan_error,
+                "unserializable_plan_error": docx_unserializable_plan_error,
+                "oversized_plan_error": docx_oversized_plan_error,
+                "ignored_extra_field": docx_ignored_extra_field,
             },
         }
     )
@@ -692,6 +749,11 @@ describe("python binding parity", () => {
       external_relationship_is_unsupported: true,
       hyperlink_requires_partial_opt_in: true,
       revision_requires_partial_opt_in: true,
+      invalid_rewrite_error: "invalid-archive",
+      invalid_plan_error: "invalid-replacement",
+      unserializable_plan_error: "invalid-replacement",
+      oversized_plan_error: "rewrite-limit-exceeded",
+      ignored_extra_field: true,
     });
   });
 

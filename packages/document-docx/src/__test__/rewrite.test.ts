@@ -3,6 +3,7 @@ import { strToU8, unzipSync, zipSync } from "fflate";
 
 import {
   DOCX_ENTRY_MAX_BYTES,
+  DocxExtractionError,
   DocxRewriteError,
   extractDocxText,
   rewriteDocxText,
@@ -33,6 +34,17 @@ const docx = (body: string): Uint8Array =>
     ),
     "word/media/image.bin": new Uint8Array([0, 1, 2, 3, 255]),
   });
+
+test("preserves extraction errors before rewriting", () => {
+  let caught: unknown;
+  try {
+    rewriteDocxText(strToU8("not a DOCX archive"), []);
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toBeInstanceOf(DocxExtractionError);
+  expect((caught as DocxExtractionError).code).toBe("invalid-archive");
+});
 
 const rewriteForFirstBlock = (
   archive: Uint8Array,
@@ -148,6 +160,83 @@ describe("rewriteDocxText", () => {
         rewriteForFirstBlock(archive, [{ start: 1, end: 2, replacement: "x" }]),
       ]),
     ).toThrow("UTF-16 boundaries");
+    let caught: unknown;
+    try {
+      rewriteDocxText(archive, [
+        rewriteForFirstBlock(archive, [
+          { start: -1, end: 2, replacement: "x" },
+        ]),
+      ]);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(DocxRewriteError);
+    expect((caught as DocxRewriteError).code).toBe("invalid-replacement");
+    caught = undefined;
+    try {
+      rewriteDocxText(archive, [
+        rewriteForFirstBlock(archive, [
+          {
+            start: 1n as unknown as number,
+            end: 2,
+            replacement: "x",
+          },
+        ]),
+      ]);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(DocxRewriteError);
+    expect((caught as DocxRewriteError).code).toBe("invalid-replacement");
+    caught = undefined;
+    const oversizedReplacements = [] as Array<
+      DocxBlockRewrite["replacements"][number]
+    >;
+    oversizedReplacements.length = 1_000_001;
+    try {
+      rewriteDocxText(archive, [
+        rewriteForFirstBlock(archive, oversizedReplacements),
+      ]);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(DocxRewriteError);
+    expect((caught as DocxRewriteError).code).toBe("rewrite-limit-exceeded");
+    const cyclicPlan = rewriteForFirstBlock(archive, [
+      { start: 3, end: 8, replacement: "Bob" },
+    ]) as DocxBlockRewrite & { unexpected?: unknown };
+    cyclicPlan.unexpected = cyclicPlan;
+    (
+      cyclicPlan.location as DocxBlockRewrite["location"] & {
+        toJSON?: () => never;
+      }
+    ).toJSON = () => {
+      throw new Error("caller toJSON must not execute");
+    };
+    const hookedPlans = [cyclicPlan] as (typeof cyclicPlan)[] & {
+      toJSON?: () => never;
+    };
+    hookedPlans.toJSON = () => {
+      throw new Error("caller toJSON must not execute");
+    };
+    const throwingIterator = () => {
+      throw new Error("caller iterator must not execute");
+    };
+    Object.defineProperty(hookedPlans, Symbol.iterator, {
+      value: throwingIterator,
+    });
+    Object.defineProperty(cyclicPlan.replacements, Symbol.iterator, {
+      value: throwingIterator,
+    });
+    const location = cyclicPlan.location as unknown as Record<string, unknown>;
+    Object.defineProperty(location["xmlPath"], Symbol.iterator, {
+      value: throwingIterator,
+    });
+    expect(
+      extractDocxText(rewriteDocxText(archive, hookedPlans).document).blocks.at(
+        0,
+      )?.text,
+    ).toBe("😀 Bob");
   });
 
   test("budgets replacement text by its escaped size, not its raw size", () => {
