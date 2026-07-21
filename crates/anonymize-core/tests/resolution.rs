@@ -370,7 +370,11 @@ fn literal_container_survives_overlapping_shorter_fragment() {
 }
 
 #[test]
-fn address_component_beats_low_confidence_name_collision() {
+fn longer_person_beats_nested_address_component_collision() {
+  // A low-score deny-list person that fully contains a high-score address
+  // token must keep the person. Preferring the nested address would drop the
+  // whole person span and leak any non-address residue (middle initials,
+  // given-name prefix) between or beside city-list hits.
   let result = merge_and_dedup(&[
     entity(DetectionSource::DenyList, 0.5, 510, 521, "person"),
     entity(DetectionSource::DenyList, 0.9, 515, 521, "address"),
@@ -378,15 +382,21 @@ fn address_component_beats_low_confidence_name_collision() {
   ]);
 
   assert!(
-    result.iter().any(|entry| entry.label == "address"
-      && entry.start == 515
+    result.iter().any(|entry| entry.label == "person"
+      && entry.start == 510
       && entry.end == 521),
     "merged entities: {result:?}",
   );
   assert!(
-    result.iter().all(|entry| !(entry.label == "person"
-      && entry.start == 510
+    result.iter().all(|entry| !(entry.label == "address"
+      && entry.start == 515
       && entry.end == 521)),
+    "merged entities: {result:?}",
+  );
+  assert!(
+    result.iter().any(|entry| entry.label == "address"
+      && entry.start == 523
+      && entry.end == 531),
     "merged entities: {result:?}",
   );
 }
@@ -499,6 +509,44 @@ fn same_span_country_loses_to_person() {
 
   assert_eq!(result.len(), 1);
   assert_eq!(result.first().expect("result").label, "person");
+}
+
+#[test]
+fn longer_person_beats_nested_city_address_fragments() {
+  // EDGAR notice lines like "Clayton E. Parker" emit a 0.5 person span that
+  // fully contains 0.9 US-city address tokens. Prefer the person so middle
+  // initials are not left between address placeholders.
+  let result = merge_and_dedup(&[
+    entity(DetectionSource::DenyList, 0.9, 0, 7, "address"),
+    entity(DetectionSource::DenyList, 0.9, 11, 17, "address"),
+    entity(DetectionSource::DenyList, 0.5, 0, 17, "person"),
+  ]);
+
+  assert_eq!(result.len(), 1);
+  let kept = result.first().expect("person");
+  assert_eq!(kept.label, "person");
+  assert_eq!(kept.start, 0);
+  assert_eq!(kept.end, 17);
+  assert!((kept.score - 0.5).abs() < f64::EPSILON);
+}
+
+#[test]
+fn nested_structured_address_beats_low_confidence_person() {
+  for source in [
+    DetectionSource::Trigger,
+    DetectionSource::Regex,
+    DetectionSource::Gazetteer,
+  ] {
+    let result = merge_and_dedup(&[
+      entity(source, 0.9, 0, 7, "address"),
+      entity(DetectionSource::DenyList, 0.5, 0, 17, "person"),
+    ]);
+
+    let kept = result.first().expect("address");
+    assert_eq!(kept.label, "address", "source: {source:?}");
+    assert_eq!(kept.start, 0, "source: {source:?}");
+    assert_eq!(kept.end, 7, "source: {source:?}");
+  }
 }
 
 #[test]
