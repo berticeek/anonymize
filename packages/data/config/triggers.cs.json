@@ -348,6 +348,15 @@
     ]
   },
   {
+    "id": "cs-reference-number",
+    "label": "registration number",
+    "strategy": {
+      "type": "n-words",
+      "count": 2
+    },
+    "triggers": ["č. j.", "číslo jednací", "číslo smlouvy"]
+  },
+  {
     "id": "soudy-nominative",
     "triggers": [
       "krajský soud",
