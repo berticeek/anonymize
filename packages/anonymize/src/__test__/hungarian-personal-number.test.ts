@@ -38,6 +38,17 @@ describe("Hungarian personal-number trigger", () => {
     },
   );
 
+  test("stops before trailing punctuation", async () => {
+    const entities = await detect("személyi szám: 1-850101-1234, lakcím");
+
+    expect(entities).toEqual([
+      expect.objectContaining({
+        label: "national identification number",
+        text: "1-850101-1234",
+      }),
+    ]);
+  });
+
   test.each(["123456AB", "1-850101-123", "1850101123"])(
     "rejects invalid value %s",
     async (value) => {

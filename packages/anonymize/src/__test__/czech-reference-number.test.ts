@@ -46,4 +46,20 @@ describe("Czech reference-number triggers", () => {
       );
     },
   );
+
+  test("stops at the identifier boundary", async () => {
+    const entities = await detect("č. j. 123/2024 ze dne 1. ledna 2024");
+
+    expect(entities.map(({ text }) => text)).toEqual(["123/2024"]);
+  });
+
+  test.each([
+    "číslo Smlouvy rámcové vymezení",
+    "číslo Smlouvy a Dílčí smlouvy (Objednávky)",
+  ])(
+    "does not treat prose after a list label as a reference: %s",
+    async (text) => {
+      expect(await detect(text)).toEqual([]);
+    },
+  );
 });

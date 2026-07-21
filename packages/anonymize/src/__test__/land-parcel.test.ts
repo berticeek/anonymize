@@ -51,6 +51,18 @@ describe("Czech land parcel triggers", () => {
     ]);
   });
 
+  test("stops a building parcel before trailing punctuation", async () => {
+    const parcels = findParcels(await detect("st. 452, k.ú. Dobříš"));
+
+    expect(parcels).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          text: "452",
+        }),
+      ]),
+    );
+  });
+
   test("k.ú. captures cadastral territory", async () => {
     const entities = await detect("k.ú. Dobříš, okres Příbram");
     const parcels = findParcels(entities);

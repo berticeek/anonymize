@@ -603,6 +603,7 @@ fn precise_over_address(label: &str) -> bool {
       | "bank account number"
       | "tax identification number"
       | "registration number"
+      | "case number"
       | "identity card number"
       | "national identification number"
       | "passport number"

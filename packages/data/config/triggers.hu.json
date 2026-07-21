@@ -14,14 +14,11 @@
   {
     "id": "hu-personal-number",
     "label": "national identification number",
-    "strategy": { "type": "n-words", "count": 1 },
-    "triggers": ["személyi szám"],
-    "validations": [
-      {
-        "type": "matches-pattern",
-        "pattern": "^(?:\\d{11}|\\d-\\d{6}-\\d{4})$"
-      }
-    ]
+    "strategy": {
+      "type": "match-pattern",
+      "pattern": "^(?:\\d{11}|\\d-\\d{6}-\\d{4})\\b"
+    },
+    "triggers": ["személyi szám"]
   },
   {
     "id": "hu-person",

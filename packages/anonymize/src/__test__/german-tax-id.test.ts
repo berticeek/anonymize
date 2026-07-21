@@ -25,6 +25,7 @@ const detect = (fullText: string): Promise<NativePipelineEntity[]> =>
 describe("German tax identification number triggers", () => {
   test.each([
     ["Steuer-ID: 36574261809", "36574261809"],
+    ["IdNr. 36574261809", "36574261809"],
     ["IdNr 36574261809", "36574261809"],
   ] as const)("%s detects the checksum-valid ID", async (text, expected) => {
     const entities = await detect(text);

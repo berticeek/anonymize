@@ -37,9 +37,21 @@ describe("case number formats", () => {
     ["UK Court of Appeal", "[2023] EWCA Civ 123", "[2023] EWCA Civ 123"],
     ["US federal docket", "1:23-cv-04567", "1:23-cv-04567"],
     ["US criminal docket", "12:22-cr-0001", "12:22-cr-0001"],
+    ["uppercase US federal docket", "Case No. 1:23-CV-04567", "1:23-CV-04567"],
+    ["uppercase US criminal docket", "Case No. 12:22-CR-0001", "12:22-CR-0001"],
     ["German Aktenzeichen", "Az. 1 BvR 123/24", "1 BvR 123/24"],
+    [
+      "punctuated German Aktenzeichen",
+      "Az. 1 BvR 123/24, weiter",
+      "1 BvR 123/24",
+    ],
     ["German full keyword", "Aktenzeichen 12 O 456/2023", "12 O 456/2023"],
     ["Polish sygnatura akt", "sygn. akt III CZP 10/23", "III CZP 10/23"],
+    [
+      "punctuated Polish sygnatura akt",
+      "sygn. akt III CZP 10/23. Dalej",
+      "III CZP 10/23",
+    ],
     ["Polish short keyword", "sygn. I ACa 1234/22", "I ACa 1234/22"],
   ] as const)("%s is detected", async (_jurisdiction, text, expected) => {
     expect(await detectCaseNumbers(text)).toEqual([
