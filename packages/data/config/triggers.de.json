@@ -66,7 +66,7 @@
       "type": "n-words",
       "count": 1
     },
-    "triggers": ["BIC", "Kontonummer"],
+    "triggers": ["Kontonummer"],
     "extensions": ["add-colon"]
   },
   {
