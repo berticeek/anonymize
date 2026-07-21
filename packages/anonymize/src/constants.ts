@@ -185,7 +185,7 @@ export const ENTITY_CAPABILITIES = [
   {
     label: "passport number",
     selection: ENTITY_SELECTIONS.DEFAULT,
-    detectionSources: [DETECTION_SOURCES.REGEX],
+    detectionSources: [DETECTION_SOURCES.REGEX, DETECTION_SOURCES.TRIGGER],
   },
   {
     label: "crypto",
