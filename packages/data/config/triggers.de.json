@@ -61,13 +61,21 @@
     "extensions": ["add-colon"]
   },
   {
+    "id": "de-commercial-register-number",
+    "label": "registration number",
+    "strategy": {
+      "type": "match-pattern",
+      "pattern": "^\\d{1,6}(?:\\s+[A-Z])?\\b"
+    },
+    "triggers": ["HRA", "HRB"]
+  },
+  {
     "id": "de-company-id",
     "label": "registration number",
     "strategy": { "type": "company-id-value" },
     "triggers": [
       "Handelsregisternummer",
       "Handelsregister",
-      "HRB",
       "Registernummer",
       "UID"
     ]
