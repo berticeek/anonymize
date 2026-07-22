@@ -18,6 +18,7 @@
  */
 import { spawnSync } from "node:child_process";
 import { Buffer } from "node:buffer";
+import { createHash } from "node:crypto";
 import {
   copyFileSync,
   cpSync,
@@ -116,6 +117,11 @@ type PythonParityOutput = {
   pdf_inspection: unknown;
   pdf_risky_inspection: unknown;
   pdf_observed_inspection: unknown;
+  pdf_raster: { document_base64: string; certificate: unknown };
+  pdf_raster_detected: { document_base64: string; certificate: unknown };
+  pdf_raster_astral: { document_base64: string; certificate: unknown };
+  pdf_detection_error: { code: string; message: string };
+  pdf_observation_limit_errors: readonly { code: string; calls: number }[];
   pdf_invalid_error: { code: string; message: string };
   caller_result: {
     redacted_text: string;
@@ -237,6 +243,35 @@ pdf_observation = [{
 pdf_observed_inspection = anonymize.inspect_pdf(
     base64.b64decode(payload["pdf_base64"]), pdf_observation
 )
+pdf_source = base64.b64decode(payload["pdf_base64"])
+pdf_pixels = bytes([255]) * (17 * 22 * 3)
+pdf_raster_request = {
+    "contractVersion": 1,
+    "sourceSha256": __import__("hashlib").sha256(pdf_source).hexdigest(),
+    "provider": {
+        "providerId": "synthetic-parity-provider",
+        "rendererName": "synthetic-renderer",
+        "rendererVersion": "1.0.0",
+        "ocrName": "synthetic-ocr",
+        "ocrVersion": "1.0.0",
+        "ocrLanguage": "eng",
+    },
+    "fillRgb": [0, 0, 0],
+    "pages": [{
+        "observation": pdf_observation[0],
+        "widthPixels": 17,
+        "heightPixels": 22,
+        "pixelSha256": __import__("hashlib").sha256(pdf_pixels).hexdigest(),
+        "detections": [{"start": 0, "end": 14}],
+    }],
+}
+pdf_raster_document, pdf_raster_certificate = anonymize.rewrite_pdf_raster_from_detections(
+    pdf_source, pdf_raster_request, [pdf_pixels]
+)
+pdf_raster = {
+    "document_base64": base64.b64encode(pdf_raster_document).decode("ascii"),
+    "certificate": pdf_raster_certificate,
+}
 try:
     anonymize.inspect_pdf(b"\\x00")
     raise AssertionError("invalid PDF bytes were accepted")
@@ -279,6 +314,10 @@ surface_probes = {
     "document.docx.anonymize": hasattr(anonymize, "anonymize_docx"),
     "document.docx.restore": hasattr(anonymize, "restore_docx_text"),
     "document.pdf.inspect": hasattr(anonymize, "inspect_pdf"),
+    "document.pdf.anonymize-raster": hasattr(anonymize, "anonymize_pdf_raster"),
+    "document.pdf.rewrite-raster": hasattr(
+        anonymize, "rewrite_pdf_raster_from_detections"
+    ),
 }
 
 caller_result = json.loads(
@@ -332,6 +371,135 @@ caller_mask_result = json.loads(
     )
 )
 prepared = anonymize.get_default_native_pipeline(language="en")
+pdf_external_batch = {
+    "version": 1,
+    "document": {"sha256": __import__("hashlib").sha256(b"Public fixture").hexdigest()},
+    "offsetUnit": "unicode-code-point",
+    "provider": {"id": "parity-provider", "name": "Parity Provider", "version": "1.0.0"},
+    "labelMap": [{"providerLabel": "person", "entityLabel": "person"}],
+    "detections": [{"id": "pdf-person-1", "start": 0, "end": 14, "label": "person", "score": 1.0}],
+}
+pdf_detected_document, pdf_detected_certificate = anonymize.anonymize_pdf_raster(
+    pdf_source,
+    prepared,
+    pdf_raster_request["provider"],
+    [{
+        "observation": pdf_observation[0],
+        "widthPixels": 17,
+        "heightPixels": 22,
+        "pixels": pdf_pixels,
+        "externalDetectionBatch": pdf_external_batch,
+    }],
+)
+pdf_raster_detected = {
+    "document_base64": base64.b64encode(pdf_detected_document).decode("ascii"),
+    "certificate": pdf_detected_certificate,
+}
+class AstralPdfDetector:
+    def redact_text(self, _text):
+        entity = type("Entity", (), {"start": 1, "end": 6})()
+        return type("Result", (), {"resolved_entities": [entity]})()
+
+pdf_astral_observation = {
+    "pageIndex": 0,
+    "widthPoints": 612.0,
+    "heightPoints": 792.0,
+    "text": "😀Alice",
+    "glyphs": [
+        {
+            "start": 0, "end": 2,
+            "bounds": {"left": 20.0, "bottom": 700.0, "right": 40.0, "top": 712.0},
+            "source": "embedded-text",
+        },
+        {
+            "start": 2, "end": 7,
+            "bounds": {"left": 72.0, "bottom": 700.0, "right": 108.0, "top": 712.0},
+            "source": "embedded-text",
+        },
+    ],
+    "rendered": True,
+    "textLayer": "complete",
+    "ocr": "complete",
+    "imageCount": 0,
+}
+pdf_astral_document, pdf_astral_certificate = anonymize.anonymize_pdf_raster(
+    pdf_source,
+    AstralPdfDetector(),
+    pdf_raster_request["provider"],
+    [{
+        "observation": pdf_astral_observation,
+        "widthPixels": 17,
+        "heightPixels": 22,
+        "pixels": pdf_pixels,
+    }],
+)
+pdf_raster_astral = {
+    "document_base64": base64.b64encode(pdf_astral_document).decode("ascii"),
+    "certificate": pdf_astral_certificate,
+}
+class FailingPdfDetector:
+    def redact_text(self, _text):
+        raise RuntimeError("sensitive provider detail")
+
+try:
+    anonymize.anonymize_pdf_raster(
+        pdf_source,
+        FailingPdfDetector(),
+        pdf_raster_request["provider"],
+        [{
+            "observation": pdf_observation[0],
+            "widthPixels": 17,
+            "heightPixels": 22,
+            "pixels": pdf_pixels,
+        }],
+    )
+    raise AssertionError("failing PDF detector was accepted")
+except anonymize.PdfRasterError as error:
+    pdf_detection_error = {"code": error.code, "message": str(error)}
+class CountingPdfDetector:
+    def __init__(self):
+        self.calls = 0
+
+    def redact_text(self, _text):
+        self.calls += 1
+        raise AssertionError("oversized observed text reached detection")
+
+pdf_observation_limit_errors = []
+oversized_page_text = "a" * (anonymize.PDF_MAX_PAGE_TEXT_UTF8_BYTES + 1)
+aggregate_page_text = "a" * anonymize.PDF_MAX_PAGE_TEXT_UTF8_BYTES
+aggregate_page_count = (
+    anonymize.PDF_MAX_OBSERVED_TEXT_UTF8_BYTES
+    // anonymize.PDF_MAX_PAGE_TEXT_UTF8_BYTES
+)
+for texts in [
+    [oversized_page_text],
+    [aggregate_page_text] * aggregate_page_count + ["a"],
+]:
+    counting_pdf_detector = CountingPdfDetector()
+    observed_pages = []
+    for page_index, text in enumerate(texts):
+        limited_observation = dict(pdf_observation[0])
+        limited_observation["pageIndex"] = page_index
+        limited_observation["text"] = text
+        observed_pages.append({
+            "observation": limited_observation,
+            "widthPixels": 17,
+            "heightPixels": 22,
+            "pixels": pdf_pixels,
+        })
+    try:
+        anonymize.anonymize_pdf_raster(
+            pdf_source,
+            counting_pdf_detector,
+            pdf_raster_request["provider"],
+            observed_pages,
+        )
+        raise AssertionError("oversized PDF observation was accepted")
+    except anonymize.PdfRasterError as error:
+        pdf_observation_limit_errors.append({
+            "code": error.code,
+            "calls": counting_pdf_detector.calls,
+        })
 session = prepared.create_redaction_session("parity_session_1")
 session_first = session.redact_text("Jan Novak signed.")
 session_second = session.redact_text("Jan Novak signed again.")
@@ -639,6 +807,11 @@ print(
             "pdf_inspection": pdf_inspection,
             "pdf_risky_inspection": pdf_risky_inspection,
             "pdf_observed_inspection": pdf_observed_inspection,
+            "pdf_raster": pdf_raster,
+            "pdf_raster_detected": pdf_raster_detected,
+            "pdf_raster_astral": pdf_raster_astral,
+            "pdf_detection_error": pdf_detection_error,
+            "pdf_observation_limit_errors": pdf_observation_limit_errors,
             "pdf_invalid_error": pdf_invalid_error,
             "caller_result": {
                 "redacted_text": caller_result["redaction"]["redacted_text"],
@@ -987,6 +1160,128 @@ describe("python binding parity", () => {
       stream_decompressed_max_bytes: 32 * 1024 * 1024,
     });
   });
+
+  pythonParityTest(
+    "PDF raster output is byte-exact across Node and Python",
+    () => {
+      const python = runPythonParity([]);
+      const source = readFileSync(
+        join(
+          ROOT_DIR,
+          "crates",
+          "anonymize-pdf-core",
+          "tests",
+          "fixtures",
+          "minimal-text.pdf",
+        ),
+      );
+      const pixels = Buffer.alloc(17 * 22 * 3, 255);
+      const sha256 = (value: Uint8Array): string =>
+        createHash("sha256").update(value).digest("hex");
+      const request = {
+        contractVersion: 1,
+        sourceSha256: sha256(source),
+        provider: {
+          providerId: "synthetic-parity-provider",
+          rendererName: "synthetic-renderer",
+          rendererVersion: "1.0.0",
+          ocrName: "synthetic-ocr",
+          ocrVersion: "1.0.0",
+          ocrLanguage: "eng",
+        },
+        fillRgb: [0, 0, 0],
+        pages: [
+          {
+            observation: {
+              pageIndex: 0,
+              widthPoints: 612,
+              heightPoints: 792,
+              text: "Public fixture",
+              glyphs: [
+                {
+                  start: 0,
+                  end: 14,
+                  bounds: { left: 72, bottom: 700, right: 108, top: 712 },
+                  source: "embedded-text",
+                },
+              ],
+              rendered: true,
+              textLayer: "complete",
+              ocr: "complete",
+              imageCount: 0,
+            },
+            widthPixels: 17,
+            heightPixels: 22,
+            pixelSha256: sha256(pixels),
+            detections: [{ start: 0, end: 14 }],
+          },
+        ],
+      };
+      const rewrite =
+        loadNativeAnonymizeBinding().rewritePdfRasterFromDetectionsJson;
+      expect(typeof rewrite).toBe("function");
+      const node = rewrite?.(source, JSON.stringify(request), [pixels]);
+      expect(python.pdf_raster).toEqual({
+        document_base64: Buffer.from(node?.document ?? []).toString("base64"),
+        certificate: JSON.parse(node?.certificateJson ?? "null"),
+      });
+      expect(python.pdf_raster_detected).toEqual(python.pdf_raster);
+      const astralObservation = {
+        pageIndex: 0,
+        widthPoints: 612,
+        heightPoints: 792,
+        text: "😀Alice",
+        glyphs: [
+          {
+            start: 0,
+            end: 2,
+            bounds: { left: 20, bottom: 700, right: 40, top: 712 },
+            source: "embedded-text",
+          },
+          {
+            start: 2,
+            end: 7,
+            bounds: { left: 72, bottom: 700, right: 108, top: 712 },
+            source: "embedded-text",
+          },
+        ],
+        rendered: true,
+        textLayer: "complete",
+        ocr: "complete",
+        imageCount: 0,
+      };
+      const astralNode = rewrite?.(
+        source,
+        JSON.stringify({
+          ...request,
+          pages: [
+            {
+              observation: astralObservation,
+              widthPixels: 17,
+              heightPixels: 22,
+              pixelSha256: sha256(pixels),
+              detections: [{ start: 2, end: 7 }],
+            },
+          ],
+        }),
+        [pixels],
+      );
+      expect(python.pdf_raster_astral).toEqual({
+        document_base64: Buffer.from(astralNode?.document ?? []).toString(
+          "base64",
+        ),
+        certificate: JSON.parse(astralNode?.certificateJson ?? "null"),
+      });
+      expect(python.pdf_detection_error).toEqual({
+        code: "detection-failed",
+        message: "detection-failed: PDF raster detection failed",
+      });
+      expect(python.pdf_observation_limit_errors).toEqual([
+        { code: "limit-exceeded", calls: 0 },
+        { code: "limit-exceeded", calls: 0 },
+      ]);
+    },
+  );
 
   pythonParityTest("python executes the full DOCX workflow", () => {
     const python = runPythonParity([]);

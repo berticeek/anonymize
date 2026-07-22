@@ -16,6 +16,7 @@ lifetime, restoration, and what metadata can still carry PII.
 | DOCX extraction/coverage           | Yes  | Yes    | No   | Yes | Aggregate inspection |
 | DOCX rewrite/anonymize/restore     | Yes  | Yes    | No   | Yes | Yes                  |
 | PDF structure/coverage inspection  | Yes  | Yes    | Yes  | No  | No                   |
+| PDF destructive raster output      | Yes  | Yes    | No   | No  | No                   |
 | Runtime capability discovery       | Yes  | Yes    | Yes  | Yes | Manifest + tools     |
 
 Node and Python DOCX adapters share bounded extraction, rewrite, and restoration
@@ -49,7 +50,21 @@ observations, coverage is reported as partial. Inspection does not anonymize a
 PDF. In particular, drawing an opaque rectangle over original page content is
 not redaction because the covered text or image can remain in the file.
 
-The repository does not yet provide PDF anonymization or structure-preserving
+The provider-neutral raster surface accepts complete rendered/OCR page
+observations and opaque RGB8 pixels, runs stella detection, merges optional
+digest-bound external detections, requires every selected span to map to glyph
+geometry, destructively fills those pixels, and writes a fresh image-only PDF
+without retaining source objects. It is currently an SDK contract: no
+renderer/OCR process adapter, CLI command, or MCP tool is bundled. Its
+certificate explicitly sets `piiCleanGuaranteed` to false because complete OCR
+coverage asserts that every page was processed, not that OCR or PII detection
+has perfect recall. Raster output deliberately removes searchability,
+accessibility, forms, links, attachments, metadata, and digital signatures.
+Both `document.pdf.anonymize-raster` and the advanced
+`document.pdf.rewrite-raster` seam are named document-profile capabilities, so
+the exhaustive Node/Python parity gate covers each public API independently.
+
+The repository does not yet provide PDF structure-preserving anonymization or
 pipelines for XLSX, PPTX, HTML, Markdown, CSV, email containers, images/OCR,
 archives, or database records. Plain UTF-8 representations can use the text
 engine, but that does not preserve or inventory their original format structure.

@@ -8,6 +8,17 @@ use lopdf::{Dictionary, Document, LoadOptions, Object};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod raster;
+
+pub use raster::{
+  PDF_RASTER_CONTRACT_VERSION, PDF_RASTER_MAX_DETECTIONS,
+  PDF_RASTER_MAX_GLYPHS, PDF_RASTER_MAX_OUTPUT_BYTES,
+  PDF_RASTER_MAX_PAGE_BYTES, PDF_RASTER_MAX_TOTAL_BYTES,
+  PDF_RASTER_REQUEST_JSON_MAX_BYTES, PdfRasterDetection, PdfRasterError,
+  PdfRasterErrorCode, PdfRasterPage, PdfRasterProvider, PdfRasterRewrite,
+  PdfRasterRewriteCertificate, rewrite_pdf_raster_from_detections,
+};
+
 pub const PDF_INSPECTION_CONTRACT_VERSION: u8 = 1;
 pub const PDF_DOCUMENT_MAX_BYTES: usize = 64 * 1024 * 1024;
 pub const PDF_STREAM_DECOMPRESSED_MAX_BYTES: usize = 32 * 1024 * 1024;

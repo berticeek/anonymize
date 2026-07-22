@@ -19,11 +19,13 @@ const nodeDocumentSurface: Partial<Record<CapabilitySurfaceId, unknown>> = {
   "document.docx.anonymize": anonymizeDocx,
   "document.docx.restore": restoreDocxText,
 };
+const DOCX_SURFACE_PREFIX = "document.docx.";
 
 describe("DOCX runtime surface parity", () => {
-  test("Node exposes every document-profile surface", () => {
+  test("Node exposes every DOCX surface in its parity profiles", () => {
     const expected = CAPABILITY_SURFACES.filter(
-      ({ profile }) =>
+      ({ id, profile }) =>
+        id.startsWith(DOCX_SURFACE_PREFIX) &&
         profile === "document" &&
         CAPABILITY_PARITY_PROFILES[profile].includes("node"),
     );

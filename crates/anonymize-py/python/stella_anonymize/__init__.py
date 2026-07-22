@@ -48,6 +48,11 @@ from .docx import (
     rewrite_docx_text,
 )
 from .pdf import (
+    PDF_RASTER_CONTRACT_VERSION,
+    PDF_RASTER_MAX_OUTPUT_BYTES,
+    PDF_RASTER_MAX_PAGE_BYTES,
+    PDF_RASTER_REQUEST_JSON_MAX_BYTES,
+    PDF_RASTER_MAX_TOTAL_BYTES,
     PDF_DOCUMENT_MAX_BYTES,
     PDF_INSPECTION_CONTRACT_VERSION,
     PDF_LOADED_PAYLOAD_MAX_BYTES,
@@ -62,7 +67,10 @@ from .pdf import (
     PDF_PAGE_DIMENSION_TOLERANCE_POINTS,
     PDF_STREAM_DECOMPRESSED_MAX_BYTES,
     PdfInspectionError,
+    PdfRasterError,
+    anonymize_pdf_raster,
     inspect_pdf,
+    rewrite_pdf_raster_from_detections,
 )
 
 __all__ = [
@@ -155,7 +163,15 @@ __all__ = [
     "PDF_PAGE_DIMENSION_TOLERANCE_POINTS",
     "PDF_STREAM_DECOMPRESSED_MAX_BYTES",
     "PdfInspectionError",
+    "PdfRasterError",
     "inspect_pdf",
+    "anonymize_pdf_raster",
+    "rewrite_pdf_raster_from_detections",
+    "PDF_RASTER_CONTRACT_VERSION",
+    "PDF_RASTER_MAX_OUTPUT_BYTES",
+    "PDF_RASTER_MAX_PAGE_BYTES",
+    "PDF_RASTER_REQUEST_JSON_MAX_BYTES",
+    "PDF_RASTER_MAX_TOTAL_BYTES",
 ]
 
 BytesLike = bytes | bytearray | memoryview
@@ -226,9 +242,7 @@ def convert_external_detection_batch(
     batch: ExternalDetectionBatch | str,
 ) -> list[CallerDetection]:
     batch_json = (
-        batch
-        if isinstance(batch, str)
-        else json.dumps(batch, separators=(",", ":"))
+        batch if isinstance(batch, str) else json.dumps(batch, separators=(",", ":"))
     )
     converted = json.loads(
         _native_convert_external_detection_batch(bytes(document), batch_json)
